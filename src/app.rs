@@ -329,7 +329,12 @@ pub struct App {
     header: f32,
     /// Per-tile hover brightness 0..1 (current hover rising, previous ones fading).
     /// [lift, tone equalisation], each easing 0..1.
-    hover_fx: HashMap<Item, [f32; 2]>,
+    /// Directly lit tiles (hovered + its parent; a handful): lifted and eased to the top tone, 0..1.
+    hover_fx: Vec<(Item, f32)>,
+    /// Folders whose whole block is lit (hovered title): lift 0..1. Kept per folder, not per tile,
+    /// so lighting 10k blocks costs nothing; `group_lit` is its per-frame (rect, eased lift) form.
+    group_fx: Vec<(Item, f32)>,
+    group_lit: Vec<(Rect, f32)>,
     /// Camera of the target layout last frame (layout rect -> screen rect), for hit-testing mid-zoom.
     cam: (Rect, Rect),
     confirm: Option<Item>,
@@ -377,7 +382,9 @@ impl App {
             menu_item: None,
             pitch: 3.0,
             header: 15.0,
-            hover_fx: HashMap::new(),
+            hover_fx: vec![],
+            group_fx: vec![],
+            group_lit: vec![],
             cam: (Rect::from_min_size(Pos2::ZERO, Vec2::splat(1.0)), Rect::from_min_size(Pos2::ZERO, Vec2::splat(1.0))),
             confirm: None,
             filter_text: String::new(),
@@ -859,26 +866,31 @@ impl App {
         // Targets: the hovered tile and that parent are lifted *and* eased to the top tone (so every
         // hovered tile reaches the same brightness); a hovered title also lifts all the blocks
         // inside its folder, keeping their tones so they stay distinguishable.
-        let mut lit: HashMap<Item, [f32; 2]> = [hover, parent].into_iter().flatten().map(|i| (i, [1.0, 1.0])).collect();
-        if on_title && let Some(i) = self.tiles.iter().position(|x| Some(x.item) == hover) {
-            // Tiles are in depth-first order: the folder's blocks directly follow it, inside its rect.
-            let r = self.tiles[i].rect;
-            for x in self.tiles[i + 1..].iter().take_while(|x| r.contains_rect(x.rect)) {
-                lit.entry(x.item).or_insert([1.0, 0.0]);
-            }
-        }
+        let lit = [hover, parent];
+        let group = hover.filter(|_| on_title);
         // Hover brightness eases in/out over HOVER_SECS; tiles just left keep a short afterglow.
         let step = ui.input(|i| i.stable_dt).min(0.1) / HOVER_SECS;
-        for &item in lit.keys() {
-            self.hover_fx.entry(item).or_insert([0.0; 2]);
-        }
+        let ease_to = |v: &mut f32, on: bool| *v = if on { (*v + step).min(1.0) } else { *v - step };
         for (item, v) in &mut self.hover_fx {
-            let goal = lit.get(item).copied().unwrap_or([0.0; 2]);
-            for k in 0..2 {
-                v[k] = if goal[k] > v[k] { (v[k] + step).min(goal[k]) } else { (v[k] - step).max(goal[k]) };
+            ease_to(v, lit.contains(&Some(*item)));
+        }
+        for (item, v) in &mut self.group_fx {
+            ease_to(v, group == Some(*item));
+        }
+        self.hover_fx.retain(|x| x.1 > 0.0);
+        self.group_fx.retain(|x| x.1 > 0.0);
+        for h in lit.into_iter().flatten() {
+            if !self.hover_fx.iter().any(|x| x.0 == h) {
+                self.hover_fx.push((h, step.min(1.0)));
             }
         }
-        self.hover_fx.retain(|_, v| v[0] > 0.0 || v[1] > 0.0);
+        if let Some(g) = group
+            && !self.group_fx.iter().any(|x| x.0 == g)
+        {
+            self.group_fx.push((g, step.min(1.0)));
+        }
+        let tiles = &self.tiles;
+        self.group_lit = self.group_fx.iter().filter_map(|&(g, v)| Some((tiles.iter().find(|x| x.item == g)?.rect, v * v * (3.0 - 2.0 * v)))).collect();
 
         let t = self.tree.as_ref().unwrap();
         let mut insts = Vec::with_capacity(self.tiles.len() * 2 + 8);
@@ -1091,7 +1103,14 @@ impl App {
         };
         let dim = self.filter.active() && !is_dir && !self.filter.matches(name, size);
         let age = now - born;
-        let [hov, eq] = self.hover_fx.get(&item).map_or([0.0; 2], |v| v.map(|x| x * x * (3.0 - 2.0 * x)));
+        let eq = self.hover_fx.iter().find(|x| x.0 == item).map_or(0.0, |x| x.1 * x.1 * (3.0 - 2.0 * x.1));
+        let mut hov = eq;
+        // Inside a lit folder (its rect strictly contains ours): lifted, own tone kept.
+        for &(g, v) in &self.group_lit {
+            if g != tile.rect && g.contains_rect(tile.rect) {
+                hov = hov.max(v);
+            }
+        }
         let glow = if age < 0.8 && r.area() > 30.0 { 6.0 * (1.0 - age / 0.8) } else { 0.0 };
         insts.push(Inst {
             rect: [r.min.x, r.min.y, r.max.x, r.max.y],
