@@ -19,9 +19,17 @@ pub fn dwm_flush() {
     unsafe { DwmFlush() };
 }
 
-pub fn drives() -> Vec<String> {
+/// Drive roots with their (total, free) bytes, if readable.
+pub fn drives() -> Vec<(String, Option<(u64, u64)>)> {
     let mask = unsafe { GetLogicalDrives() };
-    (0..26).filter(|i| mask & (1 << i) != 0).map(|i| format!("{}:\\", (b'A' + i as u8) as char)).collect()
+    (0..26)
+        .filter(|i| mask & (1 << i) != 0)
+        .map(|i| {
+            let d = format!("{}:\\", (b'A' + i as u8) as char);
+            let space = disk_space(Path::new(&d));
+            (d, space)
+        })
+        .collect()
 }
 
 /// (total, free) bytes of the volume containing `p`.

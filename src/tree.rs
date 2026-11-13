@@ -326,6 +326,24 @@ mod tests {
         assert_eq!(t.dirs.len(), 85);
     }
 
+    #[test]
+    fn sizes_stay_consistent_through_delete_and_clear() {
+        let mut t = Tree::new("R");
+        t.apply(Batch { id: 0, files: vec![("a".into(), 10), ("b".into(), 20)], dirs: vec![(1, "s".into()), (2, "u".into())] }, 0.0);
+        t.apply(Batch { id: 1, files: vec![("c".into(), 100), ("d".into(), 200)], dirs: vec![] }, 0.0);
+        t.apply(Batch { id: 2, files: vec![("e".into(), 1000)], dirs: vec![] }, 0.0);
+        let root = |t: &Tree| (t.dirs[0].size, t.dirs[0].nfiles);
+        assert_eq!(root(&t), (1330, 5));
+        t.remove(Item::File(1, 0));
+        assert_eq!((root(&t), t.dirs[1].size, &*t.dirs[1].files[0].name), ((1230, 4), 200, "d"));
+        t.remove(Item::Dir(2));
+        assert_eq!((root(&t), t.dirs[0].dirs.clone()), ((230, 3), vec![1]));
+        t.clear_dir(1);
+        assert_eq!((root(&t), t.dirs[1].size), ((30, 2), 0));
+        t.apply(Batch { id: 1, files: vec![("f".into(), 5)], dirs: vec![] }, 0.0); // its rescan
+        assert_eq!(root(&t), (35, 3));
+    }
+
     /// `cargo test --release scan_bench -- --ignored --nocapture`: time a full scan of C:\.
     #[test]
     #[ignore]

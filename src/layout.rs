@@ -155,8 +155,9 @@ fn dir(tree: &Tree, d: u32, r: Rect, depth: u16, expanded: &HashSet<u32>, g: &Gr
     out.push(Tile { rect: r, item: Item::Dir(d), open: false, titled: has_title, tone: 0 });
     // Children fill everything below the title strip: no padding gutters.
     let inner = Rect::from_min_max(pos2(r.min.x, r.min.y + g.header), r.max);
-    let wanted = depth <= DEFAULT_DEPTH || expanded.contains(&d) || expanded.contains(&x.parent);
-    if !wanted || !has_title || inner.width() < 12.0 {
+    // Opens by default only if its name fits; a folder the user clicked opens regardless.
+    let wanted = has_title && (depth <= DEFAULT_DEPTH || expanded.contains(&x.parent)) || expanded.contains(&d);
+    if !wanted || inner.width() < 12.0 || inner.height() < g.pitch {
         return;
     }
     out[idx].open = true;

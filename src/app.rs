@@ -8,7 +8,7 @@ use eframe::egui::{
 };
 use eframe::egui_wgpu::SurfaceConfig;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 const BG: Color32 = Color32::from_rgb(11, 12, 15);
@@ -106,12 +106,24 @@ struct Anim {
     /// Shared element: its title never erases, it rides the camera.
     anchor: Option<Item>,
     t0: f32,
+    /// Start of the pixel wave: `t0`, or earlier when a zoom takes over a running expand's wave.
+    wave_t0: f32,
 }
 
 impl Anim {
     fn k(&self, now: f32) -> f32 {
         let secs = if matches!(self.kind, Kind::Local { .. }) { LOCAL_SECS } else { ZOOM_SECS };
         (now - self.t0) / secs
+    }
+
+    /// A zoom that took over an expand's wave.
+    fn ridden(&self) -> bool {
+        self.wave_t0 < self.t0
+    }
+
+    /// Wave progress; a taken-over wave keeps the expand's pace.
+    fn wave_k(&self, now: f32) -> f32 {
+        if self.ridden() { (now - self.wave_t0) / LOCAL_SECS } else { self.k(now) }
     }
 }
 
@@ -276,14 +288,6 @@ struct Particle {
     size: f32,
 }
 
-enum Action {
-    Zoom(u32),
-    Open(PathBuf),
-    Reveal(PathBuf),
-    Copy(String),
-    AskDelete(Item),
-}
-
 struct Label {
     mode: LMode,
     clip: Rect,
@@ -323,6 +327,11 @@ pub struct App {
     gpu_info: String,
     hover: Option<Item>,
     menu_item: Option<Item>,
+    /// Last press on the treemap: (time, pos, folder it hit, it expanded/collapsed); a second
+    /// press there soon after zooms into that folder.
+    last_press: Option<(f64, Pos2, u32, bool)>,
+    /// The pending zoom comes from such a second press: it rides the first press's expand wave.
+    ride: bool,
     /// Dot lattice pitch and folder title height (points) for the current DPI.
     pitch: f32,
     header: f32,
@@ -379,6 +388,8 @@ impl App {
             gpu_info: String::new(),
             hover: None,
             menu_item: None,
+            last_press: None,
+            ride: false,
             pitch: 3.0,
             header: 15.0,
             hover_fx: vec![],
@@ -392,13 +403,7 @@ impl App {
             rng: 0x2545f4914f6cdd1d,
             t0: now,
             path_input: String::new(),
-            drives: win::drives()
-                .into_iter()
-                .map(|d| {
-                    let s = win::disk_space(Path::new(&d));
-                    (d, s)
-                })
-                .collect(),
+            drives: win::drives(),
             status: "Ready".into(),
             title: String::new(),
             frames: Default::default(),
@@ -474,6 +479,11 @@ impl App {
         let next = t.dirs.len() as u32;
         self.disk = win::disk_space(&self.root);
         self.anim = None;
+        // The old tiles index files that are gone, and the history can lead into orphaned dirs.
+        self.tiles.clear();
+        self.hover = None;
+        self.back.clear();
+        self.fwd.clear();
         self.begin_scan(path, self.view, next);
     }
 
@@ -560,6 +570,10 @@ impl App {
         if let Some(r) = self.tiles.iter().find(|x| x.item == item).map(|x| x.rect) {
             self.burst(r, col);
         }
+        // Files of that dir changed index (swap_remove): never hit-test those stale tiles.
+        if let Item::File(d, _) = item {
+            self.tiles.retain(|x| !matches!(x.item, Item::File(e, _) if e == d));
+        }
         if let Some((tot, free)) = self.disk.as_mut() {
             *free = (*free + freed).min(*tot);
         }
@@ -624,32 +638,40 @@ impl App {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let has_tree = self.tree.is_some();
+        // Shortcuts go through their button, so they share its enabled state.
+        let typing = ui.ctx().egui_wants_keyboard_input();
+        let (mouse4, mouse5, bksp, f5) = ui.input(|i| {
+            let p = &i.pointer;
+            (p.button_pressed(PointerButton::Extra1), p.button_pressed(PointerButton::Extra2), i.key_pressed(Key::Backspace) && !typing, i.key_pressed(Key::F5))
+        });
         let mut nav = None;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            if tool(ui, "📂", "Choose your space", true) {
+            if tool(ui, "📂", "Choose your space", true, false) {
                 self.tree = None;
                 self.scan = None;
                 self.status = "Ready".into();
+                self.drives = win::drives();
             }
             ui.separator();
-            if tool(ui, "⬅", "Back (Mouse 4)", !self.back.is_empty()) {
+            if tool(ui, "⬅", "Back (Mouse 4)", !self.back.is_empty(), mouse4) {
                 self.go_back();
             }
-            if tool(ui, "➡", "Forward (Mouse 5)", !self.fwd.is_empty()) {
+            if tool(ui, "➡", "Forward (Mouse 5)", !self.fwd.is_empty(), mouse5) {
                 self.go_fwd();
             }
-            if tool(ui, "⬆", "Up one level (Backspace)", has_tree && self.view != 0) {
+            if tool(ui, "⬆", "Up one level (Backspace)", has_tree && self.view != 0, bksp) {
                 self.go_up();
             }
-            if tool(ui, "🏠", "Root", has_tree && self.view != 0) {
+            if tool(ui, "🏠", "Root", has_tree && self.view != 0, false) {
                 nav = Some(0);
             }
             ui.separator();
-            if tool(ui, "🔄", "Rescan current view (F5)", has_tree) {
+            // Not while scanning: rescanning one folder cancels the scan of everything else.
+            if tool(ui, "🔄", "Rescan current view (F5)", has_tree && self.scan.is_none(), f5) {
                 self.rescan();
             }
-            if tool(ui, "⏹", "Stop scanning", self.scan.is_some()) {
+            if tool(ui, "⏹", "Stop scanning", self.scan.is_some(), false) {
                 self.scan = None;
                 self.status = "Stopped".into();
             }
@@ -663,7 +685,7 @@ impl App {
             if r.changed() {
                 self.filter = Filter::parse(&self.filter_text);
             }
-            if self.filter.active() && tool(ui, "✖", "Clear filter", true) {
+            if self.filter.active() && tool(ui, "✖", "Clear filter", true, false) {
                 self.filter_text.clear();
                 self.filter = Filter::default();
             }
@@ -709,7 +731,8 @@ impl App {
                 let cols = self.drives.len().clamp(1, 3) as f32;
                 let size = vec2(((ui.available_width() - (cols - 1.0) * gap) / cols / pitch).floor() * pitch, header + 20.0 * pitch);
                 let mut insts = vec![];
-                let mut texts = vec![];
+                // Pixel fields go under the names: reserve their place in the paint order.
+                let field = ui.painter().add(egui::Shape::Noop);
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = vec2(gap, gap);
                     for (i, (d, space)) in self.drives.iter().enumerate() {
@@ -740,18 +763,15 @@ impl App {
                             }
                             None => (name.to_string(), String::new()),
                         };
-                        texts.push((r, title, sub));
+                        let (p, y, font) = (ui.painter(), r.min.y + header * 0.5, FontId::proportional(12.0));
+                        p.text(pos2(r.min.x + 4.0, y), Align2::LEFT_CENTER, title, font.clone(), Color32::WHITE);
+                        p.text(pos2(r.max.x - 4.0, y), Align2::RIGHT_CENTER, sub, font, TEXT_DIM);
                         if resp.clicked() {
                             go = Some(d.clone());
                         }
                     }
                 });
-                gfx::paint(ui.painter(), ui.clip_rect(), insts, now, 0, gfx::NO_WAVE);
-                let p = ui.painter();
-                for (r, title, sub) in texts {
-                    p.text(pos2(r.min.x + 4.0, r.min.y + header * 0.5), Align2::LEFT_CENTER, title, FontId::proportional(12.0), Color32::WHITE);
-                    p.text(pos2(r.max.x - 4.0, r.min.y + header * 0.5), Align2::RIGHT_CENTER, sub, FontId::proportional(12.0), TEXT_DIM);
-                }
+                ui.painter().set(field, gfx::shape(ui.clip_rect(), insts, now, 0, gfx::NO_WAVE));
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     let r = ui.add(egui::TextEdit::singleline(&mut self.path_input).hint_text("C:\\Users").desired_width(400.0));
@@ -793,28 +813,38 @@ impl App {
         });
         let hover = hit.map(|(x, _)| x.item);
         let hit_open = hit.is_some_and(|(x, _)| x.open);
-        // Double-click zooms in on a folder's title strip, or anywhere on a folder too small to have
-        // one; a press anywhere else on a titled folder expands/collapses it. Only open folders
-        // have a title strip (closed ones show their name inside the block).
         let on_title = hit.is_some_and(|(x, p)| x.open && p.y < x.rect.min.y + self.header);
-        let untitled = hit.is_some_and(|(x, _)| matches!(x.item, Item::Dir(_)) && !x.titled);
-        // Expand reacts on mouse *down* (no click/double-click ambiguity in the body).
-        let pressed = resp.contains_pointer() && ui.input(|i| i.pointer.primary_pressed());
-        if resp.double_clicked() && (on_title || untitled) {
-            if let Some(Item::Dir(d)) = hover {
-                self.click_pos = resp.interact_pointer_pos();
-                self.navigate(d);
+        // A press on any folder expands/collapses it at once (mouse *down*); a second press at the
+        // same spot within the double-click time zooms into the folder the first press hit (for a
+        // file: its folder), taking over from the expand animation.
+        if let Some(pos) = resp.hover_pos().filter(|_| ui.input(|i| i.pointer.primary_pressed())) {
+            let time = ui.input(|i| i.time);
+            match self.last_press.take() {
+                Some((t0, p0, d, toggled)) if time - t0 < 0.3 && (pos - p0).length() < 6.0 => {
+                    if d != self.view {
+                        self.click_pos = Some(pos);
+                        self.ride = toggled;
+                        self.navigate(d);
+                    }
+                }
+                _ => {
+                    let toggled = if let Some(Item::Dir(d)) = hover
+                        && d != self.view
+                        && !on_title // the title strip only zooms (double-click), never collapses
+                        && toggle(self.tree.as_ref().unwrap(), &mut self.expanded, d, hit_open)
+                    {
+                        self.expand_ver += 1;
+                        self.toggled = Some(d);
+                        self.click_pos = Some(pos);
+                        true
+                    } else {
+                        false
+                    };
+                    if let Some(Item::Dir(d) | Item::File(d, _)) = hover {
+                        self.last_press = Some((time, pos, d, toggled));
+                    }
+                }
             }
-        } else if pressed
-            && let Some(Item::Dir(d)) = hover
-            && d != self.view
-            && !on_title
-            && !untitled
-            && toggle(self.tree.as_ref().unwrap(), &mut self.expanded, d, hit_open)
-        {
-            self.expand_ver += 1;
-            self.toggled = Some(d);
-            self.click_pos = resp.hover_pos();
         }
         {
             let t = self.tree.as_ref().unwrap();
@@ -829,8 +859,20 @@ impl App {
                     self.hover_fx.clear();
                     self.group_fx.clear();
                 }
-                let old = std::mem::take(&mut self.tiles);
+                let mut old = std::mem::take(&mut self.tiles);
                 layout::build(t, self.view, area, &self.expanded, self.pitch, &old, &mut self.tiles);
+                // A zoom right after an expand (double-click) takes over that expand's wave instead
+                // of starting a second one: it flips from the pre-expand layout, wave already under way.
+                let mut wave_t0 = now;
+                if std::mem::take(&mut self.ride)
+                    && let Some(a) = self.anim.take_if(|a| matches!(a.kind, Kind::Local { .. }))
+                {
+                    old = a.old;
+                    wave_t0 = a.t0;
+                    if let Kind::Local { click } = a.kind {
+                        self.click_pos = Some(click); // the wave's origin stays the first press
+                    }
+                }
                 let animate = prev.0 != u32::MAX && key.1 == prev.1 && (key.0 != prev.0 || key.3 != prev.3);
                 if animate {
                     let (from, to) = (prev.0, self.view);
@@ -851,7 +893,7 @@ impl App {
                     } else {
                         (Kind::Swap, None)
                     };
-                    self.anim = Some(Anim { old, kind, anchor, t0: now });
+                    self.anim = Some(Anim { old, kind, anchor, t0: now, wave_t0 });
                 } else if structural {
                     self.anim = None;
                 }
@@ -922,7 +964,18 @@ impl App {
                 Kind::Local { click } => (area, click, 0.0, (area, area), (area, area)),
                 Kind::Swap => (area, area.center(), 0.0, (area, area), (area, area)),
             };
-            let w = Wave { origin, maxd: far_corner(origin, r), k, rect: r, outside };
+            // A taken-over wave stays measured in the expand's frame (whole view, first click), carried
+            // by the old layer's camera, so its front doesn't jump; it still only flips inside `r`.
+            let (origin, maxd) = match a.kind {
+                Kind::In { click, .. } if a.ridden() => {
+                    let (f, to) = old_cam;
+                    let map = |p: Pos2| to.min + (p - f.min) * (to.size() / f.size());
+                    let o = map(click);
+                    (o, far_corner(o, Rect::from_min_max(map(area.min), map(area.max))))
+                }
+                _ => (origin, far_corner(origin, r)),
+            };
+            let w = Wave { origin, maxd, k: a.wave_k(now).clamp(0.0, 1.0), rect: r, outside };
             if let Kind::Local { .. } = a.kind {
                 // Only tiles whose rect or open-state changed go through the wave; the rest are
                 // drawn untouched underneath (they are the ancestors/neighbours of what changed).
@@ -961,15 +1014,9 @@ impl App {
             let font = FontId::proportional(l.size);
             let white = Color32::from_white_alpha((l.alpha * 255.0) as u8);
             if l.sub.is_empty() {
-                // Title strip: "name - size", else just the name, elided as a last resort.
-                let w = l.clip.width();
-                let full = if p.layout_no_wrap(l.text.clone(), font.clone(), white).size().x <= w {
-                    l.text.as_str()
-                } else {
-                    l.text.rsplit_once(" - ").map_or(l.text.as_str(), |x| x.0)
-                };
-                let mut job = egui::text::LayoutJob::simple_singleline(typed(full), font, white);
-                job.wrap.max_width = w;
+                // Title strip: "name - size", elided at the end when too wide.
+                let mut job = egui::text::LayoutJob::simple_singleline(typed(&l.text), font, white);
+                job.wrap.max_width = l.clip.max.x - l.pos.x;
                 job.wrap.max_rows = 1;
                 job.wrap.break_anywhere = true;
                 let g = p.layout_job(job);
@@ -1027,7 +1074,8 @@ impl App {
         if resp.secondary_clicked() {
             self.menu_item = hover;
         }
-        let mut action = None;
+        // Zoom and delete need `&mut self`, so they are applied after the menu; the rest act at once.
+        let (mut zoom, mut delete) = (None, None);
         let scanning = self.scan.is_some();
         resp.context_menu(|ui| {
             let Some(item) = self.menu_item else {
@@ -1039,16 +1087,16 @@ impl App {
             if let Item::Dir(d) = item
                 && ui.button("🔍  Zoom in").clicked()
             {
-                action = Some(Action::Zoom(d));
+                zoom = Some(d);
             }
             if ui.button("📄  Open").clicked() {
-                action = Some(Action::Open(path.clone()));
+                win::open(&path);
             }
             if ui.button("📁  Show in Explorer").clicked() {
-                action = Some(Action::Reveal(path.clone()));
+                win::reveal(&path);
             }
             if ui.button("📋  Copy path").clicked() {
-                action = Some(Action::Copy(path.display().to_string()));
+                ui.ctx().copy_text(path.display().to_string());
             }
             ui.separator();
             let can_del = !scanning && item != Item::Dir(0);
@@ -1057,19 +1105,14 @@ impl App {
                 .on_disabled_hover_text("Not available while scanning")
                 .clicked()
             {
-                action = Some(Action::AskDelete(item));
-            }
-            if action.is_some() {
-                ui.close();
+                delete = Some(item);
             }
         });
-        match action {
-            Some(Action::Zoom(d)) => self.navigate(d),
-            Some(Action::Open(p)) => win::open(&p),
-            Some(Action::Reveal(p)) => win::reveal(&p),
-            Some(Action::Copy(s)) => ui.ctx().copy_text(s),
-            Some(Action::AskDelete(i)) => self.confirm = Some(i),
-            None => {}
+        if let Some(d) = zoom {
+            self.navigate(d);
+        }
+        if delete.is_some() {
+            self.confirm = delete;
         }
     }
 
@@ -1207,10 +1250,10 @@ fn supports_mailbox(cc: &eframe::CreationContext, rs: &eframe::egui_wgpu::Render
     surface.get_capabilities(&rs.adapter).present_modes.contains(&wgpu::PresentMode::Mailbox)
 }
 
-fn tool(ui: &mut egui::Ui, icon: &str, tip: &str, enabled: bool) -> bool {
-    ui.add_enabled(enabled, egui::Button::new(RichText::new(icon).size(17.0)).min_size(vec2(32.0, 28.0)))
-        .on_hover_text(tip)
-        .clicked()
+/// Toolbar button; `key`: its shortcut was pressed (only acts when enabled).
+fn tool(ui: &mut egui::Ui, icon: &str, tip: &str, enabled: bool, key: bool) -> bool {
+    let clicked = ui.add_enabled(enabled, egui::Button::new(RichText::new(icon).size(17.0)).min_size(vec2(32.0, 28.0))).on_hover_text(tip).clicked();
+    enabled && (clicked || key)
 }
 
 fn setup_style(ctx: &egui::Context) {
@@ -1263,29 +1306,6 @@ impl eframe::App for App {
 
         self.pump();
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
-
-        // Global navigation input.
-        let (back, fwd, bksp, f5) = ctx.input(|i| {
-            (
-                i.pointer.button_pressed(PointerButton::Extra1),
-                i.pointer.button_pressed(PointerButton::Extra2),
-                i.key_pressed(Key::Backspace),
-                i.key_pressed(Key::F5),
-            )
-        });
-        let typing = ctx.egui_wants_keyboard_input();
-        if back {
-            self.go_back();
-        }
-        if fwd {
-            self.go_fwd();
-        }
-        if bksp && !typing {
-            self.go_up();
-        }
-        if f5 && self.tree.is_some() {
-            self.rescan();
-        }
 
         egui::Panel::top("toolbar")
             .frame(egui::Frame::NONE.fill(BG).inner_margin(Margin::symmetric(10, 6)))
