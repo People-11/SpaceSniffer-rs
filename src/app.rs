@@ -288,7 +288,6 @@ struct Label {
     mode: LMode,
     clip: Rect,
     pos: Pos2,
-    align: Align2,
     text: String,
     /// File labels: size line under the (up to 2-line) name; empty for folder titles.
     sub: String,
@@ -955,13 +954,26 @@ impl App {
         for l in labels {
             let e = wave.as_ref().map(|w| w.at(l.pos, ((l.pos.x * 12.9898 + l.pos.y * 78.233).sin() * 43758.547).fract().abs()));
             let typed = |s: &str| e.map_or_else(|| s.to_string(), |e| typed(s, e, l.mode));
-            let p = painter.with_clip_rect(l.clip.intersect(painter.clip_rect()));
+            // Static labels always fit their tile, so they share the treemap's clip and egui draws all
+            // text in one batch; only mid-transition (tiles resizing under them) are they clipped
+            // per tile. No shadow: labels sit on a dark title strip or a dimmed quiet zone.
+            let p = if wave.is_some() { painter.with_clip_rect(l.clip.intersect(painter.clip_rect())) } else { painter.clone() };
             let font = FontId::proportional(l.size);
-            let (shadow, white) = (Color32::from_black_alpha((l.alpha * 220.0) as u8), Color32::from_white_alpha((l.alpha * 255.0) as u8));
+            let white = Color32::from_white_alpha((l.alpha * 255.0) as u8);
             if l.sub.is_empty() {
-                let text = typed(&l.text);
-                p.text(l.pos + vec2(1.0, 1.0), l.align, &text, font.clone(), shadow);
-                p.text(l.pos, l.align, &text, font, white);
+                // Title strip: "name - size", else just the name, elided as a last resort.
+                let w = l.clip.width();
+                let full = if p.layout_no_wrap(l.text.clone(), font.clone(), white).size().x <= w {
+                    l.text.as_str()
+                } else {
+                    l.text.rsplit_once(" - ").map_or(l.text.as_str(), |x| x.0)
+                };
+                let mut job = egui::text::LayoutJob::simple_singleline(typed(full), font, white);
+                job.wrap.max_width = w;
+                job.wrap.max_rows = 1;
+                job.wrap.break_anywhere = true;
+                let g = p.layout_job(job);
+                p.galley(l.pos - vec2(0.0, g.size().y * 0.5), g, white);
                 continue;
             }
             // File: name wrapped to at most 2 lines, size below; if that doesn't fit, no label at all.
@@ -981,9 +993,7 @@ impl App {
             let (name, sub) = (wrapped(typed(&l.text)), p.layout_no_wrap(typed(&l.sub), font.clone(), white));
             let top = l.pos.y - (full.size().y + sub.size().y) * 0.5;
             for (g, y) in [(name, top), (sub, top + full.size().y)] {
-                let at = pos2(l.pos.x, y) - g.rect.center_top().to_vec2();
-                p.galley_with_override_text_color(at + vec2(1.0, 1.0), g.clone(), shadow);
-                p.galley(at, g, white);
+                p.galley(pos2(l.pos.x, y) - g.rect.center_top().to_vec2(), g, white);
             }
         }
         painter.set(field, gfx::shape(area, insts, now, 1, wave.as_ref().map_or(gfx::NO_WAVE, Wave::gpu)));
@@ -1135,7 +1145,6 @@ impl App {
                 mode,
                 clip: Rect::from_min_max(r.min, pos2(r.max.x - 2.0, (r.min.y + self.header).min(r.max.y))),
                 pos: pos2(r.min.x + 4.0, r.min.y + self.header * 0.5),
-                align: Align2::LEFT_CENTER,
                 text: format!("{} - {}", name, fmt_size(size)),
                 sub: String::new(),
                 room: Vec2::ZERO,
@@ -1149,7 +1158,6 @@ impl App {
                 mode,
                 clip: r.shrink(2.0),
                 pos: r.center(),
-                align: Align2::CENTER_CENTER,
                 text: name.to_string(),
                 sub: fmt_size(size),
                 room: lr.shrink(3.0).size(),

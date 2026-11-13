@@ -159,8 +159,10 @@ fn fs(v: V) -> @location(0) vec4f {
     // field, so space left by children too small to lay out still reads as dots, not a hole.
     // A directly hovered tile eases to the top tone first, so all of them reach the same brightness.
     let tone = mix(v.q.z, 1.0, v.o.y);
-    let base = col * (0.55 + 0.45 * tone);
-    var rgb = base * (0.01 + 0.05 * tone + dot * mix(0.07 + 0.17 * tone, 1.0, lit) * (1.0 - 0.6 * quiet));
+    // Unlit-dot level is evenly spaced across the 4 tones (~20/46/71/97 of 255) so every step reads.
+    let base = col * (0.7 + 0.5 * tone);
+    let unlit = col * (0.08 + 0.30 * tone);
+    var rgb = col * (0.01 + 0.05 * tone) + dot * mix(unlit, base, lit) * (1.0 - 0.6 * quiet);
     // Directory header strip.
     if (v.pt.y < v.rect.y + v.q.x) { rgb = base * 0.16 + vec3f(0.03); }
     rgb *= inten;

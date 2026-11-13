@@ -60,50 +60,85 @@ pub fn build(tree: &Tree, root: u32, area: Rect, expanded: &HashSet<u32>, pitch:
 /// Number of brightness tones (4 colours always suffice for a map of rectangles in practice).
 pub const TONES: u8 = 4;
 
-/// Greedy map colouring of the visible tiles (everything not open), on a dot-lattice occupancy
-/// grid. Tiles already visible in `prev` keep their tone unless it now clashes with a neighbour
-/// (so expanding a folder never recolours the blocks around it); the rest then each take the tone
-/// farthest from those of their already-coloured edge neighbours.
+/// Map colouring of the visible tiles (everything not open) on a dot-lattice grid of tile indices.
+/// Big tiles go first; each takes the tone sharing the least edge length with same-toned coloured
+/// neighbours (ties: the one farthest from the other neighbours' tones). Tiles
+/// visible in `prev` keep their tone when it clashes with nothing, so expanding a folder doesn't
+/// recolour the blocks around it; a final pass recolours any tile still clashing.
 fn tones(out: &mut [Tile], area: Rect, pitch: f32, prev: &[Tile]) {
-    let cols = (area.width() / pitch).round() as usize;
-    let rows = (area.height() / pitch).round() as usize;
-    let mut map = vec![u8::MAX; cols * rows];
+    const NEAR: [f32; TONES as usize] = [0.0, 0.3, 0.08, 0.0]; // secondary cost by tone distance
+    let cols = (area.width() / pitch).round() as isize;
+    let rows = (area.height() / pitch).round() as isize;
     let at = |v: f32, o: f32| ((v - o) / pitch).round() as isize;
-    let old: HashMap<Item, u8> = prev.iter().filter(|t| !t.open).map(|t| (t.item, t.tone)).collect();
-    let mut done = vec![false; out.len()];
-    for keep in [true, false] {
-        for (t, done) in out.iter_mut().zip(&mut done).filter(|(t, d)| !t.open && !**d) {
-            let (x0, y0) = (at(t.rect.min.x, area.min.x), at(t.rect.min.y, area.min.y));
-            let (x1, y1) = (at(t.rect.max.x, area.min.x), at(t.rect.max.y, area.min.y));
-            let mut near = [false; TONES as usize];
-            let mut look = |x: isize, y: isize| {
-                if x >= 0 && y >= 0 && (x as usize) < cols && (y as usize) < rows {
-                    let v = map[y as usize * cols + x as usize];
-                    if v != u8::MAX {
-                        near[v as usize] = true;
-                    }
+    let cells = |t: &Tile| {
+        let (x0, y0) = (at(t.rect.min.x, area.min.x).max(0), at(t.rect.min.y, area.min.y).max(0));
+        (x0, y0, at(t.rect.max.x, area.min.x).min(cols), at(t.rect.max.y, area.min.y).min(rows))
+    };
+    let mut order: Vec<usize> = (0..out.len()).filter(|&i| !out[i].open).collect();
+    order.sort_by(|&a, &b| out[b].rect.area().total_cmp(&out[a].rect.area()));
+    let mut map = vec![u32::MAX; (cols * rows).max(0) as usize];
+    for &i in &order {
+        let (x0, y0, x1, y1) = cells(&out[i]);
+        for y in y0..y1 {
+            map[(y * cols + x0) as usize..(y * cols + x1) as usize].fill(i as u32);
+        }
+    }
+    let mut tone = vec![u8::MAX; out.len()];
+    // Shared boundary length (in dots) with already-coloured neighbours, per neighbour tone.
+    let near = |i: usize, tone: &[u8]| {
+        let (x0, y0, x1, y1) = cells(&out[i]);
+        let mut w = [0.0f32; TONES as usize];
+        let mut look = |x: isize, y: isize| {
+            if (0..cols).contains(&x) && (0..rows).contains(&y) {
+                let j = map[(y * cols + x) as usize];
+                if j != u32::MAX && tone[j as usize] != u8::MAX {
+                    w[tone[j as usize] as usize] += 1.0;
                 }
-            };
-            for x in x0..x1 {
-                look(x, y0 - 1);
-                look(x, y1);
             }
-            for y in y0..y1 {
-                look(x0 - 1, y);
-                look(x1, y);
-            }
-            let gap = |c: u8| (0..TONES).filter(|&n| near[n as usize]).map(|n| n.abs_diff(c)).min().unwrap_or(TONES);
-            t.tone = match old.get(&t.item) {
-                Some(&c) if keep && !near[c as usize] => c,
-                _ if keep => continue,
-                _ => (0..TONES).max_by_key(|&c| (gap(c), c)).unwrap(),
-            };
-            *done = true;
-            for y in y0.max(0)..y1.min(rows as isize) {
-                let row = y as usize * cols;
-                map[row + x0.max(0) as usize..row + x1.min(cols as isize) as usize].fill(t.tone);
+        };
+        for x in x0..x1 {
+            look(x, y0 - 1);
+            look(x, y1);
+        }
+        for y in y0..y1 {
+            look(x0 - 1, y);
+            look(x1, y);
+        }
+        w
+    };
+    // Same-tone edge first (any clash-free tone wins), then how close the other neighbours' tones are.
+    let cost = |w: &[f32; TONES as usize], c: u8| (w[c as usize], (0..TONES).map(|n| w[n as usize] * NEAR[n.abs_diff(c) as usize]).sum::<f32>());
+    let best = |w: &[f32; TONES as usize]| (0..TONES).min_by(|&a, &b| cost(w, a).partial_cmp(&cost(w, b)).unwrap()).unwrap();
+    let old: HashMap<Item, u8> = prev.iter().filter(|t| !t.open).map(|t| (t.item, t.tone)).collect();
+    for &i in &order {
+        if let Some(&c) = old.get(&out[i].item)
+            && near(i, &tone)[c as usize] == 0.0
+        {
+            tone[i] = c;
+        }
+    }
+    for &i in &order {
+        if tone[i] == u8::MAX {
+            tone[i] = best(&near(i, &tone));
+        }
+    }
+    // Local repair: recolour wherever another tone clashes less, until nothing changes.
+    for _ in 0..4 {
+        let mut changed = false;
+        for &i in &order {
+            let w = near(i, &tone);
+            let c = best(&w);
+            if w[tone[i] as usize] > 0.0 && cost(&w, c) < cost(&w, tone[i]) {
+                tone[i] = c;
+                changed = true;
             }
         }
+        if !changed {
+            break;
+        }
+    }
+    for &i in &order {
+        out[i].tone = tone[i];
     }
 }
 
@@ -266,6 +301,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Total edge length shared by visible tiles of the same tone, and by the larger ones (> 2000pt²).
+    fn clashes(out: &[Tile]) -> (f32, f32) {
+        let vis: Vec<_> = out.iter().filter(|x| !x.open).collect();
+        let (mut all, mut big) = (0.0, 0.0);
+        for (i, a) in vis.iter().enumerate() {
+            for b in &vis[i + 1..] {
+                let r = a.rect.intersect(b.rect);
+                let len = if r.width() == 0.0 { r.height() } else if r.height() == 0.0 { r.width() } else { 0.0 };
+                if len > 0.0 && a.tone == b.tone {
+                    all += len;
+                    if a.rect.area() > 2000.0 && b.rect.area() > 2000.0 {
+                        big += len;
+                    }
+                }
+            }
+        }
+        (all, big)
+    }
+
+    /// `SS_DIR=<folder> cargo test --release tone_clash_real -- --ignored --nocapture`:
+    /// same-tone shared edges on a real folder.
+    #[test]
+    #[ignore]
+    fn tone_clash_real() {
+        let root = std::env::var("SS_DIR").unwrap();
+        let scan = crate::tree::start(root.clone().into(), 0, 1);
+        // Relayout after every batch, keeping tones from the previous layout, as the app does while scanning.
+        let mut t = Tree::new(&root);
+        let (mut out, mut prev) = (vec![], vec![]);
+        while let Ok(crate::tree::Msg::Batch(b)) = scan.rx.recv() {
+            t.apply(b, 0.0);
+            std::mem::swap(&mut out, &mut prev);
+            build(&t, 0, Rect::from_min_size(pos2(0.0, 0.0), vec2(1260.0, 680.0)), &HashSet::new(), 8.0 / 3.0, &prev, &mut out);
+        }
+        let (all, big) = clashes(&out);
+        eprintln!("{} visible tiles, same-tone shared edge: {all:.0}pt total, {big:.0}pt between big tiles", out.iter().filter(|x| !x.open).count());
     }
 
     #[test]
