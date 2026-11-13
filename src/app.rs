@@ -824,6 +824,12 @@ impl App {
             let structural = key.0 != prev.0 || key.1 != prev.1 || key.3 != prev.3;
             // Relayout costs ~0.2 ms: follow the scan every frame so new tiles grow smoothly.
             if structural || key.2 != prev.2 {
+                if key.0 != prev.0 {
+                    // New view: drop hover afterglow. A lit folder's rect is looked up in the current
+                    // layout, so the folder just entered (now the whole view) would light everything.
+                    self.hover_fx.clear();
+                    self.group_fx.clear();
+                }
                 let old = std::mem::take(&mut self.tiles);
                 layout::build(t, self.view, area, &self.expanded, self.pitch, &old, &mut self.tiles);
                 let animate = prev.0 != u32::MAX && key.1 == prev.1 && (key.0 != prev.0 || key.3 != prev.3);
