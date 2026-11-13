@@ -14,7 +14,8 @@ fn main() -> eframe::Result {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("SpaceSniffer-rs")
             .with_inner_size([1280.0, 860.0])
-            .with_min_inner_size([720.0, 480.0]),
+            .with_min_inner_size([720.0, 480.0])
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).expect("embedded icon")),
         ..Default::default()
     };
     // Start on Fifo (always supported); App switches to Mailbox + DwmFlush pacing if the surface allows it.

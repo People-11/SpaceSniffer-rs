@@ -976,11 +976,13 @@ impl App {
         if let (Some(item), Some(at)) = (self.hover, resp.hover_pos())
             && !egui::Popup::is_any_open(ui.ctx())
         {
-            let path = t.path(item);
             let size = t.size(item);
-            let extra = match item {
-                Item::Dir(d) => format!("{} files", t.dirs[d as usize].nfiles),
-                Item::File(d, f) => CATS[t.dirs[d as usize].files[f as usize].cat as usize].0.to_string(),
+            let (name, extra) = match item {
+                Item::Dir(d) => (&t.dirs[d as usize].name, format!("{} files", t.dirs[d as usize].nfiles)),
+                Item::File(d, f) => {
+                    let x = &t.dirs[d as usize].files[f as usize];
+                    (&x.name, CATS[x.cat as usize].0.to_string())
+                }
             };
             egui::Area::new(egui::Id::unique("tile_tip"))
                 .order(egui::Order::Tooltip)
@@ -989,7 +991,7 @@ impl App {
                 .show(ui.ctx(), |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                        ui.label(RichText::new(path.display().to_string()).strong());
+                        ui.label(RichText::new(&**name).strong());
                         ui.label(format!("{}  ·  {}", fmt_size(size), extra));
                     });
                 });
