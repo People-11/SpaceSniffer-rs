@@ -22,7 +22,7 @@ const ZOOM_SECS: f32 = 0.65;
 const HOVER_SECS: f32 = 0.15;
 
 /// Every folder shares one color (SpaceSniffer-style sand); files are colored by type.
-const FOLDER_RGB: [f32; 3] = [180.0 / 255.0, 128.0 / 255.0, 70.0 / 255.0];
+const FOLDER_RGB: [f32; 3] = [184.0 / 255.0, 116.0 / 255.0, 66.0 / 255.0];
 
 fn rgb(c: u8) -> [f32; 3] {
     let [r, g, b] = CATS[c as usize].1;
