@@ -22,7 +22,7 @@ struct Inst {
     @location(0) rect: vec4f,  // min.xy, max.xy (points, screen space)
     @location(1) color: vec4f, // rgb, intensity
     @location(2) p: vec4f,     // kind, glow radius(pt), role (0 static, 1 incoming, 2 outgoing), unused
-    @location(3) q: vec4f,     // header h(pt), hover, tone (0..1), unused
+    @location(3) q: vec4f,     // header h(pt), hover, tone (0..1), label visibility (0..1)
     @location(4) t: vec4f,     // label box (min.xy, max.xy); empty = none
 };
 
@@ -124,12 +124,12 @@ fn fs(v: V) -> @location(0) vec4f {
     }
 
     // Quiet zone: dots under a label and up to 2 dots around it are dimmed, so the text always
-    // sits on a dark patch.
+    // sits on a dark patch; it fades with the label during transitions.
     var quiet = 0.0;
     if (v.t.z > v.t.x) {
         let cc = (cell + 0.5) * cs / u.ppp;
         let out = max(v.t.xy - cc, cc - v.t.zw);
-        quiet = clamp(1.0 - max(out.x, out.y) / (2.0 * cs / u.ppp), 0.0, 1.0);
+        quiet = clamp(1.0 - max(out.x, out.y) / (2.0 * cs / u.ppp), 0.0, 1.0) * v.q.w;
     }
 
     // Ordered dither: every dot takes one of 5 levels. A tile's value picks the mix of two adjacent

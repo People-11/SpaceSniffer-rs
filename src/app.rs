@@ -235,15 +235,19 @@ enum LMode {
     Erase,
 }
 
-/// Visible prefix of a label for wave value `e` (see [`Wave::at`]): erases just ahead of the
-/// front, types in while its cells cool down behind it.
-fn typed(text: &str, e: f32, mode: LMode) -> String {
-    let f = match mode {
-        LMode::Full => return text.to_string(),
-        LMode::TypeIn => e / WAVE_COOL,
-        LMode::Erase => -e / 0.12,
+/// How much of a label shows for wave value `e` (see [`Wave::at`]), 0..1: an outgoing label fades
+/// out over the stretch just ahead of the front (gone as its dots flip), an incoming one types in
+/// while its cells cool down behind it.
+fn shown(e: f32, mode: LMode) -> f32 {
+    match mode {
+        LMode::Full => 1.0,
+        LMode::TypeIn => (e / WAVE_COOL).clamp(0.0, 1.0),
+        LMode::Erase => (-e / WAVE_COOL).clamp(0.0, 1.0),
     }
-    .clamp(0.0, 1.0);
+}
+
+/// The first `f` (0..1) of `text`, for typing in.
+fn typed(text: &str, f: f32) -> String {
     let n = text.chars().count();
     text.chars().take((n as f32 * f).ceil() as usize).collect()
 }
@@ -1034,13 +1038,17 @@ impl App {
         let field = painter.add(egui::Shape::Noop);
         for l in labels {
             let e = wave.as_ref().map(|w| w.at(l.pos, ((l.pos.x * 12.9898 + l.pos.y * 78.233).sin() * 43758.547).fract().abs()));
-            let typed = |s: &str| e.map_or_else(|| s.to_string(), |e| typed(s, e, l.mode));
+            // Outgoing labels fade as a whole, incoming ones type in; the dark patch under a file
+            // label follows the same amount, so it never outstays (or precedes) its text.
+            let f = e.map_or(1.0, |e| shown(e, l.mode));
+            let fade = if l.mode == LMode::Erase { f } else { 1.0 };
+            let typed = |s: &str| if l.mode == LMode::TypeIn { typed(s, f) } else { s.to_string() };
             // Static labels always fit their tile, so they share the treemap's clip and egui draws all
             // text in one batch; only mid-transition (tiles resizing under them) are they clipped
             // per tile. No shadow: labels sit on a dark title strip or a dimmed quiet zone.
             let p = if wave.is_some() { painter.with_clip_rect(l.clip.intersect(painter.clip_rect())) } else { painter.clone() };
             let font = FontId::proportional(l.size);
-            let white = Color32::from_white_alpha((l.alpha * 255.0) as u8);
+            let white = Color32::from_white_alpha((l.alpha * fade * 255.0) as u8);
             if l.sub.is_empty() {
                 // Title strip: "name - size", elided at the end when too wide.
                 let mut job = egui::text::LayoutJob::simple_singleline(typed(&l.text), font, white);
@@ -1065,6 +1073,7 @@ impl App {
             }
             let bx = Rect::from_center_size(l.pos, vec2(full.size().x.max(sub.size().x), full.size().y + sub.size().y));
             insts[l.inst].t = [bx.min.x, bx.min.y, bx.max.x, bx.max.y];
+            insts[l.inst].q[3] = f;
             let (name, sub) = (wrapped(typed(&l.text)), p.layout_no_wrap(typed(&l.sub), font.clone(), white));
             let top = l.pos.y - (full.size().y + sub.size().y) * 0.5;
             for (g, y) in [(name, top), (sub, top + full.size().y)] {
@@ -1422,12 +1431,14 @@ mod tests {
         assert!(w(0.0).at(pos2(0.0, 0.0), 0.0) >= 0.0, "the click point flips on the first frame");
         assert!(w(0.4).at(pos2(5.0, 5.0), 0.0) > w(0.4).at(pos2(90.0, 90.0), 0.0));
         assert!(w(0.9).at(pos2(150.0, 0.0), 0.0) < 0.0);
-        assert_eq!(typed("abcd", 0.0, LMode::TypeIn), "");
-        assert_eq!(typed("abcd", WAVE_COOL * 0.5, LMode::TypeIn), "ab");
-        assert_eq!(typed("abcd", WAVE_COOL, LMode::TypeIn), "abcd");
-        assert_eq!(typed("abcd", -1.0, LMode::Erase), "abcd");
-        assert_eq!(typed("abcd", 0.0, LMode::Erase), "");
-        assert_eq!(typed("abcd", 0.3, LMode::Full), "abcd");
+        assert_eq!(typed("abcd", shown(0.0, LMode::TypeIn)), "");
+        assert_eq!(typed("abcd", shown(WAVE_COOL * 0.5, LMode::TypeIn)), "ab");
+        assert_eq!(typed("abcd", shown(WAVE_COOL, LMode::TypeIn)), "abcd");
+        // Outgoing: whole until the fade starts, half gone halfway, gone as the front arrives.
+        assert_eq!(shown(-1.0, LMode::Erase), 1.0);
+        assert_eq!(shown(-WAVE_COOL * 0.5, LMode::Erase), 0.5);
+        assert_eq!(shown(0.0, LMode::Erase), 0.0);
+        assert_eq!(shown(0.3, LMode::Full), 1.0);
     }
 
     /// Root (1) > mid (2) > inner (3) title strips: whichever way and however fast the pointer

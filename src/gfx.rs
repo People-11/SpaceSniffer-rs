@@ -13,7 +13,7 @@ pub struct Inst {
     pub color: [f32; 4],
     /// kind (FIELD / PARTICLE), glow radius (pt), transition role (STATIC / INCOMING / OUTGOING), unused.
     pub p: [f32; 4],
-    /// Title strip height (pt), hover 0..1, tone 0..1, unused.
+    /// Title strip height (pt), hover 0..1, tone 0..1, label visibility 0..1 (scales the label box's dimming).
     pub q: [f32; 4],
     /// Label box (screen min.xy, max.xy): dots under and around it stay dim. NO_TEXT = none.
     pub t: [f32; 4],
