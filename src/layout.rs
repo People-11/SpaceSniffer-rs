@@ -65,8 +65,8 @@ pub const TONES: u8 = 4;
 /// Map colouring of the visible tiles (everything not open) on a dot-lattice grid of tile indices.
 /// Big tiles go first; each takes the tone sharing the least edge length with same-toned coloured
 /// neighbours (ties: the one farthest from the other neighbours' tones). Tiles
-/// visible in `prev` keep their tone when it clashes with nothing, so expanding a folder doesn't
-/// recolour the blocks around it; a final pass recolours any tile still clashing.
+/// visible in `prev` keep their tone (see below), so expanding a folder doesn't recolour the
+/// blocks around it; a final pass recolours any other tile still clashing.
 fn tones(out: &mut [Tile], area: Rect, pitch: f32, prev: &[Tile]) {
     const NEAR: [f32; TONES as usize] = [0.0, 0.3, 0.08, 0.0]; // secondary cost by tone distance
     let cols = (area.width() / pitch).round() as isize;
@@ -111,9 +111,21 @@ fn tones(out: &mut [Tile], area: Rect, pitch: f32, prev: &[Tile]) {
     // Same-tone edge first (any clash-free tone wins), then how close the other neighbours' tones are.
     let cost = |w: &[f32; TONES as usize], c: u8| (w[c as usize], (0..TONES).map(|n| w[n as usize] * NEAR[n.abs_diff(c) as usize]).sum::<f32>());
     let best = |w: &[f32; TONES as usize]| (0..TONES).min_by(|&a, &b| cost(w, a).partial_cmp(&cost(w, b)).unwrap()).unwrap();
-    let old: HashMap<Item, u8> = prev.iter().filter(|t| !t.open).map(|t| (t.item, t.tone)).collect();
+    // A tile that did not move keeps its tone whatever happens around it (so far-off blocks never
+    // change colour when a folder opens); one that moved keeps it if that clashes with nothing.
+    let old: HashMap<Item, (u8, Rect)> = prev.iter().filter(|t| !t.open).map(|t| (t.item, (t.tone, t.rect))).collect();
+    let mut still = vec![false; out.len()];
     for &i in &order {
-        if let Some(&c) = old.get(&out[i].item)
+        if let Some(&(c, r)) = old.get(&out[i].item)
+            && r == out[i].rect
+        {
+            tone[i] = c;
+            still[i] = true;
+        }
+    }
+    for &i in &order {
+        if let Some(&(c, _)) = old.get(&out[i].item)
+            && !still[i]
             && near(i, &tone)[c as usize] == 0.0
         {
             tone[i] = c;
@@ -127,7 +139,7 @@ fn tones(out: &mut [Tile], area: Rect, pitch: f32, prev: &[Tile]) {
     // Local repair: recolour wherever another tone clashes less, until nothing changes.
     for _ in 0..4 {
         let mut changed = false;
-        for &i in &order {
+        for &i in order.iter().filter(|&&i| !still[i]) {
             let w = near(i, &tone);
             let c = best(&w);
             if w[tone[i] as usize] > 0.0 && cost(&w, c) < cost(&w, tone[i]) {
@@ -382,6 +394,12 @@ mod tests {
         for f in 0..9 {
             let i = Item::File(2, f);
             assert_eq!(tone(&before, i), tone(&after, i), "{i:?}");
+        }
+        // No tile that stayed where it was changes colour, however far from the change.
+        for a in after.iter().filter(|a| !a.open) {
+            if let Some(b) = before.iter().find(|b| b.item == a.item && b.rect == a.rect && !b.open) {
+                assert_eq!(a.tone, b.tone, "{:?}", a.item);
+            }
         }
     }
 

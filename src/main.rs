@@ -24,13 +24,24 @@ fn main() -> eframe::Result {
     // Vulkan only (DX12 support costs ~0.7 MB of exe); discrete GPU first.
     setup.instance_descriptor.backends = wgpu::Backends::VULKAN;
     setup.native_adapter_selector = Some(Arc::new(|adapters, surface| {
+        use wgpu::DeviceType::*;
         adapters
             .iter()
             .filter(|a| surface.is_none_or(|s| a.is_surface_supported(s)))
-            .max_by_key(|a| a.get_info().device_type == wgpu::DeviceType::DiscreteGpu)
+            // Never a software (CPU) Vulkan over a real GPU.
+            .min_by_key(|a| match a.get_info().device_type {
+                DiscreteGpu => 0,
+                IntegratedGpu => 1,
+                VirtualGpu => 2,
+                Cpu => 3,
+                Other => 4,
+            })
             .cloned()
             .ok_or_else(|| "No Vulkan adapter found".to_string())
     }));
+    // Our GPU data is a few MB: allocate in small blocks, not wgpu's default 128-256 MB ones.
+    let base = setup.device_descriptor.clone();
+    setup.device_descriptor = Arc::new(move |a| wgpu::DeviceDescriptor { memory_hints: wgpu::MemoryHints::MemoryUsage, ..base(a) });
     opts.wgpu_options.wgpu_setup = WgpuSetup::CreateNew(setup);
     let run = eframe::run_native("SpaceSniffer-rs", opts, Box::new(|cc| Ok(Box::new(app::App::new(cc)))));
     if let Err(e) = &run {

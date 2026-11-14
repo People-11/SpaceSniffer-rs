@@ -314,13 +314,15 @@ fn far_corner(o: Pos2, r: Rect) -> f32 {
 /// per step, see [`Wave::at`]): (typed-in part, opacity), each 0..1; nothing where another layer
 /// shows. A label types in while the cells of the wave that brought it cool down behind the front,
 /// and fades out over the stretch just ahead of the wave that takes it away (gone as its dots flip).
-fn shown(es: &[f32], lo: usize, hi: usize) -> (f32, f32) {
+/// `fixed` (a step's shared title): the wave that brought it does not touch it (it shows even where
+/// the layer under it still does), but a later one takes it away like any other.
+fn shown(es: &[f32], lo: usize, hi: usize, fixed: bool) -> (f32, f32) {
     let s = es.iter().rposition(|&e| e >= 0.0).map_or(0, |i| i + 1);
-    if s < lo || s > hi {
+    if s > hi || s < lo && !fixed {
         return (0.0, 0.0);
     }
-    let typed = if s == lo && lo > 0 { (es[lo - 1] / WAVE_COOL).clamp(0.0, 1.0) } else { 1.0 };
-    let fade = if s == hi && hi < es.len() { (-es[hi] / WAVE_COOL).clamp(0.0, 1.0) } else { 1.0 };
+    let typed = if s == lo && lo > 0 && !fixed { (es[lo - 1] / WAVE_COOL).clamp(0.0, 1.0) } else { 1.0 };
+    let fade = if hi < es.len() { (-es[hi] / WAVE_COOL).clamp(0.0, 1.0) } else { 1.0 };
     (typed, fade)
 }
 
@@ -728,11 +730,19 @@ impl App {
             // Breadcrumb, right aligned, deepest last.
             if let Some(t) = &self.tree {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Deepest first, as far up as there is room left of it ("…" for the rest); the
+                    // current folder itself is cut short if even it does not fit.
+                    let font = egui::TextStyle::Button.resolve(ui.style());
                     let mut d = self.view;
                     loop {
-                        let txt = RichText::new(&*t.dirs[d as usize].name)
-                            .color(if d == self.view { Color32::WHITE } else { TEXT_DIM });
-                        if ui.add(egui::Button::new(txt).frame(false)).clicked() {
+                        let name = &*t.dirs[d as usize].name;
+                        let need = ui.painter().layout_no_wrap(name.into(), font.clone(), TEXT_DIM).size().x + 2.0 * ui.spacing().button_padding.x;
+                        if d != self.view && need > ui.available_width() {
+                            ui.label(RichText::new("…").color(TEXT_DIM));
+                            break;
+                        }
+                        let txt = RichText::new(name).color(if d == self.view { Color32::WHITE } else { TEXT_DIM });
+                        if ui.add(egui::Button::new(txt).frame(false).truncate()).clicked() {
                             nav = Some(d);
                         }
                         if d == 0 {
@@ -982,7 +992,7 @@ impl App {
             let es: Vec<f32> = waves.iter().map(|w| w.at(l.pos, jitter)).collect();
             // Outgoing labels fade as a whole, incoming ones type in; the dark patch under a file
             // label follows the same amount, so it never outstays (or precedes) its text.
-            let (f_in, fade) = if l.fixed { (1.0, 1.0) } else { shown(&es, l.lo, l.hi) };
+            let (f_in, fade) = shown(&es, l.lo, l.hi, l.fixed);
             if f_in * fade <= 0.0 {
                 continue;
             }
@@ -1385,22 +1395,28 @@ mod tests {
         let g = Wave { origin: c, maxd: far_corner(c, r), k: 0.0, rect: r, outside: true };
         assert!(g.dist(pos2(0.0, 0.0)) < 0.01 && g.dist(c) > 0.99);
         // Incoming (layer 1 of 2) types in as its cells cool.
-        assert_eq!(typed("abcd", shown(&[0.0], 1, 1).0), "");
-        assert_eq!(typed("abcd", shown(&[WAVE_COOL * 0.5], 1, 1).0), "ab");
-        assert_eq!(typed("abcd", shown(&[WAVE_COOL], 1, 1).0), "abcd");
+        assert_eq!(typed("abcd", shown(&[0.0], 1, 1, false).0), "");
+        assert_eq!(typed("abcd", shown(&[WAVE_COOL * 0.5], 1, 1, false).0), "ab");
+        assert_eq!(typed("abcd", shown(&[WAVE_COOL], 1, 1, false).0), "abcd");
         // Outgoing: whole until the fade starts, half gone halfway, gone as the front arrives.
-        assert_eq!(shown(&[-1.0], 0, 0), (1.0, 1.0));
-        assert_eq!(shown(&[-WAVE_COOL * 0.5], 0, 0), (1.0, 0.5));
-        assert_eq!(shown(&[0.0], 0, 0).1, 0.0);
+        assert_eq!(shown(&[-1.0], 0, 0, false), (1.0, 1.0));
+        assert_eq!(shown(&[-WAVE_COOL * 0.5], 0, 0, false), (1.0, 0.5));
+        assert_eq!(shown(&[0.0], 0, 0, false).1, 0.0);
         // Shared by both layers (unchanged by an expand): untouched. No transition: full.
-        assert_eq!(shown(&[0.1], 0, 1), (1.0, 1.0));
-        assert_eq!(shown(&[], 0, 0), (1.0, 1.0));
+        assert_eq!(shown(&[0.1], 0, 1, false), (1.0, 1.0));
+        assert_eq!(shown(&[], 0, 0, false), (1.0, 1.0));
         // Stacked: where the newer wave has passed, only the top layer shows, even if the older
         // one has not got there yet; where only the older one has, the middle layer does.
-        assert_eq!(shown(&[-0.5, WAVE_COOL], 2, 2), (1.0, 1.0));
-        assert_eq!(shown(&[-0.5, WAVE_COOL], 0, 0).1, 0.0);
-        assert_eq!(shown(&[WAVE_COOL, -1.0], 1, 1), (1.0, 1.0));
-        assert_eq!(shown(&[WAVE_COOL, -1.0], 2, 2).1, 0.0);
+        assert_eq!(shown(&[-0.5, WAVE_COOL], 2, 2, false), (1.0, 1.0));
+        assert_eq!(shown(&[-0.5, WAVE_COOL], 0, 0, false).1, 0.0);
+        assert_eq!(shown(&[WAVE_COOL, -1.0], 1, 1, false), (1.0, 1.0));
+        assert_eq!(shown(&[WAVE_COOL, -1.0], 2, 2, false).1, 0.0);
+        // A shared title: whole before and through the wave that brought it, but the next wave
+        // (a second quick click) still erases it.
+        assert_eq!(shown(&[-1.0, -1.0], 1, 1, true), (1.0, 1.0));
+        assert_eq!(shown(&[0.0, -1.0], 1, 1, true), (1.0, 1.0));
+        assert_eq!(shown(&[WAVE_COOL, 0.0], 1, 1, true).1, 0.0);
+        assert_eq!(shown(&[-1.0, 0.0], 1, 1, true).1, 0.0);
     }
 
     /// Interrupting a zoom never makes anything jump: zoom into a child, then halfway back out
