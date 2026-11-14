@@ -191,16 +191,31 @@ fn dir(tree: &Tree, d: u32, r: Rect, depth: u16, expanded: &HashSet<u32>, g: &Gr
     };
     let mut placed = Vec::new();
     let mut k = kids.len();
+    // A block too small for its own gutter would leave its neighbours open: it is given more room
+    // than its files' share (up to MAX_REST of the body), the others shrinking to make way.
+    let mut boost = 1.0;
     loop {
         placed.clear();
         let mut top = kids[..k].to_vec();
         if k < kids.len() {
-            top.push((kids[k..].iter().map(|t| t.0).sum(), REST));
+            top.push((kids[k..].iter().map(|t| t.0).sum::<f64>() * boost, REST));
         }
+        let total: f64 = top.iter().map(|t| t.0).sum();
+        top.iter_mut().for_each(|t| t.0 *= area / total);
         squarify(&top, inner, &mut placed);
         // squarify keeps the order, so the first small tile's index is its index in `kids`.
         match placed.iter().position(|p| p.1 != REST && small(p.0)) {
             Some(j) => k = j,
+            None if k > 0 && placed.last().is_some_and(|p| p.1 == REST && small(p.0)) => {
+                if top.last().is_some_and(|t| t.0 < area * MAX_REST) {
+                    boost *= 1.5;
+                } else {
+                    // Still too small at that size: too small to show at all, like the sub-dot
+                    // tiles above; the rest grow to fill the body.
+                    kids.truncate(k);
+                    boost = 1.0;
+                }
+            }
             None => break,
         }
     }
@@ -229,6 +244,8 @@ fn dir(tree: &Tree, d: u32, r: Rect, depth: u16, expanded: &HashSet<u32>, g: &Gr
 
 /// Smallest tile side (dots) that gets a gutter; must match the gutter rule in shader.wgsl.
 const MIN_GUTTER: f32 = 3.0;
+/// Most of a folder's body its block of small tiles may take to make room for its gutter.
+const MAX_REST: f64 = 0.25;
 /// Placeholder for the block of small tiles while laying out (no dir has this index).
 const REST: Item = Item::Dir(u32::MAX);
 
@@ -381,6 +398,23 @@ mod tests {
         let inner = Rect::from_min_max(pos2(root.min.x, root.min.y + header(3.0)), root.max);
         let covered: f32 = out[1..].iter().map(|x| x.rect.area()).sum();
         assert!((covered - inner.area()).abs() < 1e-2, "{covered} vs {}", inner.area());
+    }
+
+    /// A remainder too small to outline as a block is given room for its gutter: it stays visible
+    /// (in its own outlined block), and the big file keeps its own outline instead of being merged.
+    #[test]
+    fn a_tiny_remainder_still_gets_an_outlined_block() {
+        let mut t = Tree::new("R");
+        t.apply(crate::tree::Batch { id: 0, files: vec![("big".into(), 1_000_000), ("tiny".into(), 1_500)], dirs: vec![] });
+        let p = 3.0;
+        let mut out = vec![];
+        build(&t, 0, Rect::from_min_size(pos2(0.0, 0.0), vec2(300.0, 200.0)), &HashSet::new(), p, &[], &mut out);
+        assert_eq!(out.len(), 3, "root + big + tiny");
+        let (big, tiny) = (&out[1], &out[2]);
+        assert!(!big.solid && tiny.solid);
+        // One dot of gutter between them, on the tiny file's top or left.
+        let gap = (tiny.rect.min.y - big.rect.max.y).max(tiny.rect.min.x - big.rect.max.x);
+        assert!((gap - p).abs() < 0.01, "gap {gap}");
     }
 
     /// Files too small for their own gutter sit together in one block, and that block has a whole

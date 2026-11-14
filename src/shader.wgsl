@@ -167,10 +167,10 @@ fn fs(v: V) -> @location(0) vec4f {
     // The wave's light lifts the tile's own levels (no white overlay): the pattern itself glows
     // and settles back as it cools.
     n = min(n + 2.0 * born, 3.9);
-    // Directory header strip: sparse and dark under its title. A label's quiet zone takes the
-    // same level as an unlit strip (a fading label's mixes the two, still pure dither).
+    // Directory header strip: sparse and dark under its title, lit on hover. A label's quiet zone
+    // takes the level of a lit strip (a fading label's mixes it with the tile's, still pure dither).
     let strip = 0.4 + 2.0 * born;
-    n = mix(n, strip, quiet);
+    n = mix(n, strip + 0.6, quiet);
     if (v.pt.y < v.rect.y + v.q.x) { n = strip + 0.6 * hover; }
     let fl = min(floor(n), 3.0);
     var level = fl + step(bayer4(cell), clamp(n - fl, 0.1, 0.9));
