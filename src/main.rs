@@ -32,5 +32,9 @@ fn main() -> eframe::Result {
             .ok_or_else(|| "No Vulkan adapter found".to_string())
     }));
     opts.wgpu_options.wgpu_setup = WgpuSetup::CreateNew(setup);
-    eframe::run_native("SpaceSniffer-rs", opts, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))
+    let run = eframe::run_native("SpaceSniffer-rs", opts, Box::new(|cc| Ok(Box::new(app::App::new(cc)))));
+    if let Err(e) = &run {
+        win::error_box(&format!("Could not start (a Vulkan-capable GPU driver is required):\n{e}"));
+    }
+    run
 }

@@ -157,7 +157,9 @@ impl Tree {
         }
     }
 
-    /// Empty a directory before rescanning it (old descendant slots are simply orphaned).
+    /// Empty a directory before rescanning it.
+    // shortcut: old descendant slots are orphaned, never reused; compact after a scan if repeated
+    // refreshes of huge trees make memory grow.
     pub fn clear_dir(&mut self, d: u32) {
         let x = &self.dirs[d as usize];
         self.add_up(d, x.size, x.nfiles, false);

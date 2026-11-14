@@ -304,44 +304,6 @@ mod tests {
         }
     }
 
-    /// Total edge length shared by visible tiles of the same tone, and by the larger ones (> 2000pt²).
-    fn clashes(out: &[Tile]) -> (f32, f32) {
-        let vis: Vec<_> = out.iter().filter(|x| !x.open).collect();
-        let (mut all, mut big) = (0.0, 0.0);
-        for (i, a) in vis.iter().enumerate() {
-            for b in &vis[i + 1..] {
-                let r = a.rect.intersect(b.rect);
-                let len = if r.width() == 0.0 { r.height() } else if r.height() == 0.0 { r.width() } else { 0.0 };
-                if len > 0.0 && a.tone == b.tone {
-                    all += len;
-                    if a.rect.area() > 2000.0 && b.rect.area() > 2000.0 {
-                        big += len;
-                    }
-                }
-            }
-        }
-        (all, big)
-    }
-
-    /// `SS_DIR=<folder> cargo test --release tone_clash_real -- --ignored --nocapture`:
-    /// same-tone shared edges on a real folder.
-    #[test]
-    #[ignore]
-    fn tone_clash_real() {
-        let root = std::env::var("SS_DIR").unwrap();
-        let scan = crate::tree::start(root.clone().into(), 0, 1);
-        // Relayout after every batch, keeping tones from the previous layout, as the app does while scanning.
-        let mut t = Tree::new(&root);
-        let (mut out, mut prev) = (vec![], vec![]);
-        while let Ok(crate::tree::Msg::Batch(b)) = scan.rx.recv() {
-            t.apply(b);
-            std::mem::swap(&mut out, &mut prev);
-            build(&t, 0, Rect::from_min_size(pos2(0.0, 0.0), vec2(1260.0, 680.0)), &HashSet::new(), 8.0 / 3.0, &prev, &mut out);
-        }
-        let (all, big) = clashes(&out);
-        eprintln!("{} visible tiles, same-tone shared edge: {all:.0}pt total, {big:.0}pt between big tiles", out.iter().filter(|x| !x.open).count());
-    }
-
     #[test]
     fn expanding_a_folder_keeps_the_tones_around_it() {
         use crate::tree::Batch;

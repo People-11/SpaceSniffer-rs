@@ -97,6 +97,44 @@ fn place(t: &Tree, tiles: &[Tile], view: u32, area: Rect, expanded: &HashSet<u32
     find_rect(t, &out, d)
 }
 
+/// One frame of hover easing. `direct`: (item, level 0..1) of tiles lit on their own (`lit`: the
+/// hovered tile and its parent); `groups`: folders whose whole block is lit (`group`: the hovered
+/// title's folder). Levels move by `step` per frame.
+///
+/// Moving between nested titles (or a title and a block under it) must never dim or stall what
+/// stays lit, however fast and however many levels:
+/// - an entry inside the folder now being lit keeps rising until that folder has caught up with
+///   it (its tiles are about to be lit by that folder anyway), then fades unseen beneath it;
+/// - what is lit is never dimmer than the lit folders around it, so it starts from their level.
+fn ease_hover(direct: &mut Vec<(Item, f32)>, groups: &mut Vec<(Item, f32)>, lit: [Option<Item>; 2], group: Option<Item>, step: f32, rect_of: impl Fn(Item) -> Option<Rect>) {
+    let inside = |it: Item, outer: Rect| rect_of(it).is_some_and(|r| r != outer && outer.contains_rect(r));
+    // Inherit first, from the levels as they were shown last frame, then move everything a step.
+    for h in lit.into_iter().flatten() {
+        if !direct.iter().any(|x| x.0 == h) {
+            direct.push((h, 0.0));
+        }
+    }
+    if let Some(g) = group
+        && !groups.iter().any(|x| x.0 == g)
+    {
+        groups.push((g, 0.0));
+    }
+    let around = |it: Item, groups: &[(Item, f32)]| groups.iter().filter(|g| rect_of(g.0).is_some_and(|r| inside(it, r))).map(|g| g.1).fold(0.0, f32::max);
+    for x in direct.iter_mut().filter(|x| lit.contains(&Some(x.0))) {
+        x.1 = x.1.max(around(x.0, groups));
+    }
+    if let Some(i) = groups.iter().position(|x| Some(x.0) == group) {
+        groups[i].1 = groups[i].1.max(around(groups[i].0, groups));
+    }
+    let target = group.and_then(|g| Some((rect_of(g)?, groups.iter().find(|x| x.0 == g)?.1)));
+    let carried = |it: Item, v: f32| target.is_some_and(|(r, tv)| tv < v && inside(it, r));
+    let ease = |x: &mut (Item, f32), on: bool| x.1 = if on || carried(x.0, x.1) { (x.1 + step).min(1.0) } else { x.1 - step };
+    direct.iter_mut().for_each(|x| ease(x, lit.contains(&Some(x.0))));
+    groups.iter_mut().for_each(|x| ease(x, group == Some(x.0)));
+    direct.retain(|x| x.1 > 0.0);
+    groups.retain(|x| x.1 > 0.0);
+}
+
 #[derive(Clone, Copy)]
 enum Kind {
     /// Zoom into a child whose tile was `small` in the old layout.
@@ -450,8 +488,10 @@ impl App {
             self.status = format!("Not a folder: {p}");
             return;
         }
+        // Every path shown, opened or recycled is built from the root: make it absolute.
+        let pb = std::path::absolute(&pb).unwrap_or(pb);
         self.disk = win::disk_space(&pb);
-        self.tree = Some(Tree::new(&p));
+        self.tree = Some(Tree::new(&pb.to_string_lossy()));
         self.root = pb.clone();
         self.reset_nav();
         self.begin_scan(pb, 0, 1);
@@ -476,6 +516,9 @@ impl App {
 
     /// Rescan only the current view (SpaceSniffer "refresh").
     fn rescan(&mut self) {
+        // An open context menu / delete dialog names its item by index: gone or reused after this.
+        self.menu_item = None;
+        self.confirm = None;
         let Some(t) = self.tree.as_mut() else { return };
         self.scan = None;
         if self.view == 0 {
@@ -633,9 +676,8 @@ impl App {
             out.push(Inst {
                 rect: [p.pos.x - s, p.pos.y - s, p.pos.x + s, p.pos.y + s],
                 color: [p.col[0], p.col[1], p.col[2], k * k * 1.4],
-                p: [0.0, 0.0, gfx::PARTICLE, 3.0],
+                p: [gfx::PARTICLE, 3.0, gfx::STATIC, 0.0],
                 q: [0.0; 4],
-                o: gfx::STATIC,
                 t: gfx::NO_TEXT,
             });
         }
@@ -723,7 +765,6 @@ impl App {
 
     fn chooser(&mut self, ui: &mut egui::Ui) {
         let mut go = None;
-        let now = self.now();
         let pitch = layout::grid(ui.ctx().pixels_per_point());
         let header = layout::header(pitch);
         ui.vertical_centered(|ui| {
@@ -750,9 +791,8 @@ impl App {
                         let block = |rect: Rect, inten: f32, head: f32| Inst {
                             rect: [rect.min.x, rect.min.y, rect.max.x, rect.max.y],
                             color: [FOLDER_RGB[0], FOLDER_RGB[1], FOLDER_RGB[2], inten],
-                            p: [0.0, 0.0, gfx::FIELD, 0.0],
+                            p: [gfx::FIELD, 0.0, gfx::STATIC, 0.0],
                             q: [head, hov, 0.5, 0.0],
-                            o: gfx::STATIC,
                             t: gfx::NO_TEXT,
                         };
                         let body = Rect::from_min_max(pos2(r.min.x, r.min.y + header), r.max);
@@ -778,7 +818,7 @@ impl App {
                         }
                     }
                 });
-                ui.painter().set(field, gfx::shape(ui.clip_rect(), insts, now, 0, gfx::NO_WAVE));
+                ui.painter().set(field, gfx::shape(ui.clip_rect(), insts, 0, gfx::NO_WAVE));
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     let r = ui.add(egui::TextEdit::singleline(&mut self.path_input).hint_text("C:\\Users").desired_width(400.0));
@@ -923,26 +963,8 @@ impl App {
         let group = hover.filter(|_| on_title);
         // Hover brightness eases in/out over HOVER_SECS; tiles just left keep a short afterglow.
         let step = ui.input(|i| i.stable_dt).min(0.1) / HOVER_SECS;
-        let ease_to = |v: &mut f32, on: bool| *v = if on { (*v + step).min(1.0) } else { *v - step };
-        for (item, v) in &mut self.hover_fx {
-            ease_to(v, lit.contains(&Some(*item)));
-        }
-        for (item, v) in &mut self.group_fx {
-            ease_to(v, group == Some(*item));
-        }
-        self.hover_fx.retain(|x| x.1 > 0.0);
-        self.group_fx.retain(|x| x.1 > 0.0);
-        for h in lit.into_iter().flatten() {
-            if !self.hover_fx.iter().any(|x| x.0 == h) {
-                self.hover_fx.push((h, step.min(1.0)));
-            }
-        }
-        if let Some(g) = group
-            && !self.group_fx.iter().any(|x| x.0 == g)
-        {
-            self.group_fx.push((g, step.min(1.0)));
-        }
         let tiles = &self.tiles;
+        ease_hover(&mut self.hover_fx, &mut self.group_fx, lit, group, step, |it| tiles.iter().find(|x| x.item == it).map(|x| x.rect));
         self.group_lit = self.group_fx.iter().filter_map(|&(g, v)| Some((tiles.iter().find(|x| x.item == g)?.rect, v * v * (3.0 - 2.0 * v)))).collect();
 
         let t = self.tree.as_ref().unwrap();
@@ -1049,7 +1071,7 @@ impl App {
                 p.galley(pos2(l.pos.x, y) - g.rect.center_top().to_vec2(), g, white);
             }
         }
-        painter.set(field, gfx::shape(area, insts, now, 1, wave.as_ref().map_or(gfx::NO_WAVE, Wave::gpu)));
+        painter.set(field, gfx::shape(area, insts, 1, wave.as_ref().map_or(gfx::NO_WAVE, Wave::gpu)));
 
         // Interaction.
         // Own tooltip instead of egui's: shown at once and kept up while the tiles change under a
@@ -1177,9 +1199,8 @@ impl App {
         insts.push(Inst {
             rect: [r.min.x, r.min.y, r.max.x, r.max.y],
             color: [col[0], col[1], col[2], if dim { DIM } else { 1.0 }],
-            p: [0.0, 0.0, gfx::FIELD, 0.0],
+            p: [gfx::FIELD, 0.0, role, 0.0],
             q: [if tile.open { self.header } else { 0.0 }, hov, tile.tone as f32 / (layout::TONES - 1) as f32, 0.0],
-            o: [role, 0.0, 0.0, 0.0],
             t: gfx::NO_TEXT,
         });
         let inst = insts.len() - 1;
@@ -1338,7 +1359,7 @@ impl eframe::App for App {
                 }
                 self.treemap(ui);
                 let parts = self.step_particles(dt);
-                gfx::paint(ui.painter(), ui.clip_rect(), parts, self.now(), 2, gfx::NO_WAVE);
+                gfx::paint(ui.painter(), ui.clip_rect(), parts, 2, gfx::NO_WAVE);
             });
 
         self.delete_modal(&ctx);
@@ -1407,6 +1428,54 @@ mod tests {
         assert_eq!(typed("abcd", -1.0, LMode::Erase), "abcd");
         assert_eq!(typed("abcd", 0.0, LMode::Erase), "");
         assert_eq!(typed("abcd", 0.3, LMode::Full), "abcd");
+    }
+
+    /// Root (1) > mid (2) > inner (3) title strips: whichever way and however fast the pointer
+    /// crosses them, a block that ends up lit never dims and never stalls on the way to full.
+    #[test]
+    fn hover_across_nested_titles_never_dims_or_stalls() {
+        let rect = |i: f32| Rect::from_min_max(pos2(i, i), pos2(100.0 - i, 100.0 - i));
+        // dirs 1..=3 nested; "tiles" 11, 12, 13 sit directly inside each of them
+        let rect_of = |it: Item| match it {
+            Item::Dir(d @ 1..=3) => Some(rect(d as f32 * 10.0)),
+            Item::Dir(d @ 11..=13) => Some(Rect::from_min_size(pos2((d - 10) as f32 * 10.0 + 1.0, (d - 10) as f32 * 10.0 + 1.0), vec2(2.0, 2.0))),
+            _ => None,
+        };
+        // brightness of a tile, as `App::draw` combines it
+        let level = |tile: u32, direct: &[(Item, f32)], groups: &[(Item, f32)]| {
+            let r = rect_of(Item::Dir(tile)).unwrap();
+            let own = direct.iter().find(|x| x.0 == Item::Dir(tile)).map_or(0.0, |x| x.1);
+            groups.iter().filter(|g| rect_of(g.0).is_some_and(|o| o != r && o.contains_rect(r))).map(|g| g.1).fold(own, f32::max)
+        };
+        let step = 0.1;
+        // (titles hovered in turn, frames spent on each but the last, tiles that must behave)
+        let cases: [(&[u32], usize, &[u32]); 5] = [
+            (&[3, 2, 1], 3, &[13, 12]), // outwards, each left a third of the way
+            (&[1, 2, 3], 3, &[13]),     // inwards
+            (&[3, 2, 3, 2, 1], 2, &[13]),
+            (&[1, 2, 1, 2, 3], 2, &[13]),
+            (&[2, 3, 1], 4, &[13, 12]),
+        ];
+        for (path, dwell, watch) in cases {
+            let (mut direct, mut groups) = (vec![], vec![]);
+            let frame = |g: u32, direct: &mut Vec<_>, groups: &mut Vec<_>| ease_hover(direct, groups, [Some(Item::Dir(g)), None], Some(Item::Dir(g)), step, rect_of);
+            (0..20).for_each(|_| frame(path[0], &mut direct, &mut groups)); // first title fully lit
+            let mut last: Vec<f32> = watch.iter().map(|&t| level(t, &direct, &groups)).collect();
+            let frames = path[1..].iter().enumerate().flat_map(|(i, &g)| std::iter::repeat_n(g, if i + 2 == path.len() { 20 } else { dwell }));
+            for g in frames {
+                frame(g, &mut direct, &mut groups);
+                for (t, last) in watch.iter().zip(&mut last) {
+                    let now = level(*t, &direct, &groups);
+                    // lit by the hovered folder: must rise every frame until full (tiles outside it may fade)
+                    let lit = rect_of(Item::Dir(g)).unwrap().contains_rect(rect_of(Item::Dir(*t)).unwrap());
+                    if lit {
+                        assert!(now >= (*last + step * 0.99).min(1.0), "tile {t} on title {g} in {path:?}: {last} -> {now}");
+                    }
+                    *last = now;
+                }
+            }
+            assert!(last.iter().all(|&v| v == 1.0), "{path:?} ends lit: {last:?}");
+        }
     }
 
     #[test]

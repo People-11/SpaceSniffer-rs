@@ -2,14 +2,15 @@
 // "pixel field" (5 levels, ordered dither) and the particles' additive glow.
 //
 // Transitions are done by the dot matrix itself (no alpha cross-fades): a wave sweeps from the
-// click point; as it passes, each dot cell flips from the old layer to the new one in place, the
-// new dot born white-hot and cooling down. A cell is never empty, so the front has no dark gap.
+// click point; as it passes, each dot cell flips from the old layer to the new one in place. The
+// front carries light: it lifts the levels of the dots around it, which then cool back down.
+// A cell is never empty, so the front has no dark gap.
 
 struct U {
     origin: vec2f,
     size: vec2f,
     ppp: f32,
-    time: f32,
+    _pad0: f32,
     _pad: vec2f,
     wave: vec4f,  // origin.xy, max distance, progress K (0..1)
     wrect: vec4f, // region the wave acts on (min.xy, max.xy)
@@ -20,10 +21,9 @@ struct U {
 struct Inst {
     @location(0) rect: vec4f,  // min.xy, max.xy (points, screen space)
     @location(1) color: vec4f, // rgb, intensity
-    @location(2) p: vec4f,     // unused, unused, kind, glow radius(pt)
+    @location(2) p: vec4f,     // kind, glow radius(pt), role (0 static, 1 incoming, 2 outgoing), unused
     @location(3) q: vec4f,     // header h(pt), hover, tone (0..1), unused
-    @location(4) o: vec4f,     // role: 0 static, 1 incoming, 2 outgoing
-    @location(5) t: vec4f,     // label box (min.xy, max.xy); empty = none
+    @location(4) t: vec4f,     // label box (min.xy, max.xy); empty = none
 };
 
 struct V {
@@ -33,8 +33,7 @@ struct V {
     @location(2) @interpolate(flat) color: vec4f,
     @location(3) @interpolate(flat) p: vec4f,
     @location(4) @interpolate(flat) q: vec4f,
-    @location(5) @interpolate(flat) o: vec4f,
-    @location(6) @interpolate(flat) t: vec4f,
+    @location(5) @interpolate(flat) t: vec4f,
 };
 
 @vertex
@@ -53,7 +52,6 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> V {
     o.color = i.color;
     o.p = i.p;
     o.q = i.q;
-    o.o = i.o;
     o.t = i.t;
     return o;
 }
@@ -86,12 +84,12 @@ fn wave_e(p: vec2f, cs: f32) -> f32 {
 
 @fragment
 fn fs(v: V) -> @location(0) vec4f {
-    let kind = u32(v.p.z);
-    let glow = v.p.w;
+    let kind = u32(v.p.x);
+    let glow = v.p.y;
     let col = v.color.rgb;
     let inten = v.color.a;
     let hover = v.q.y;
-    let role = u32(v.o.x);
+    let role = u32(v.p.z);
 
     // Dot lattice fixed to the screen, in physical pixels: like an LED matrix, the dots never
     // move or scale; zooming tiles slide their colours across it. Tiles at rest sit exactly on it.
@@ -101,13 +99,15 @@ fn fs(v: V) -> @location(0) vec4f {
     let cell = floor(gp / cs);
     // Transition: each screen cell belongs to exactly one layer (both layers evaluate the same
     // cell centre), so the two never overlap or leave a hole, even while the camera zooms.
+    // Light of the wave front: rises on the old layer just ahead of it, cools on the new one.
     var born = 0.0;
     if (role != 0u) {
         let sc = (floor(v.pt * u.ppp / cs) + 0.5) * cs / u.ppp;
         let e = wave_e(sc, cs);
         if ((role == 2u) == (e >= 0.0)) { discard; }
         let c = 1.0 - clamp(e / COOL, 0.0, 1.0);
-        born = select(0.0, c * c, role == 1u);
+        let ahead = clamp(1.0 + e / (COOL * 0.25), 0.0, 1.0);
+        born = select(ahead * ahead, c * c, role == 1u);
     }
 
     let half = (v.rect.zw - v.rect.xy) * 0.5;
@@ -140,25 +140,26 @@ fn fs(v: V) -> @location(0) vec4f {
     let org = round(v.rect.xy * u.ppp / cs);
     let ts = max(round((v.rect.zw - v.rect.xy) * u.ppp / cs), vec2f(1.0));
     let rd = cell - org;
-    // The 4 tones sit between two levels (25 % / 75 % mixes: 1.25, 1.75, 2.25, 2.75), never on
-    // one, so no tile turns into a solid block; a slight top-left light varies the pattern.
-    let g = 1.0 - (rd.x / ts.x + rd.y / ts.y) * 0.5;
-    var n = 1.25 + 0.5 * round(tone * 3.0) + (g - 0.5) * 0.2;
+    // The 4 tones sit between two levels (around 30 % / 70 % mixes: 1.3, 1.7, 2.3, 2.7), never on
+    // one, so no tile turns into a solid block. A top-left light sweeps each tile through ~6 Bayer
+    // steps (+-0.175 of a level), staying inside its own half so tones never meet. The bands
+    // always run at 45 degrees whatever the tile's shape, spread evenly from corner to corner.
+    let g = 1.0 - (rd.x + rd.y) / (ts.x + ts.y);
+    let k = round(tone * 3.0);
+    var n = 1.3 + 0.4 * k + 0.2 * floor(k * 0.5) + (g - 0.5) * 0.35;
     n = mix(n, 3.9, hover);
+    // The wave's light lifts the tile's own levels (no white overlay): the pattern itself glows
+    // and settles back as it cools.
+    n = min(n + 2.0 * born, 3.9);
     n *= 1.0 - 0.8 * quiet;
     // Directory header strip: sparse and dark under its title.
-    if (v.pt.y < v.rect.y + v.q.x) { n = 0.4 + 0.6 * hover; }
+    if (v.pt.y < v.rect.y + v.q.x) { n = 0.4 + 0.6 * hover + 2.0 * born; }
     let fl = min(floor(n), 3.0);
-    var level = fl + step(bayer4(cell), clamp(n - fl, 0.15, 0.85));
+    var level = fl + step(bayer4(cell), clamp(n - fl, 0.1, 0.9));
     // Gutter: the top row and left column of every tile big enough to spare them, so each shared
     // edge is one dark line; smaller tiles are told apart by their pattern alone.
     if (min(ts.x, ts.y) >= 3.0 && min(rd.x, rd.y) < 0.5) { level = 0.0; }
     var rgb = col * (0.07 + 0.93 * pow(level / 4.0, 1.6));
-    rgb *= inten;
-
-    // Newborn transition dots are white-hot, dithered: a share of the dots turns white and they go
-    // out one by one in Bayer order as they cool. Offset matrix so the white set doesn't just
-    // repeat the tile's own pattern.
-    if (bayer4(cell + vec2f(2.0, 1.0)) < born) { rgb = mix(rgb, vec3f(1.0), 0.7); }
+    rgb *= (1.0 + 0.5 * born * born) * inten; // highlight at the wave front: brighter, same colour
     return vec4f(rgb, 1.0);
 }

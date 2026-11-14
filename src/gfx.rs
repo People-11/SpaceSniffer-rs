@@ -11,17 +11,17 @@ use wgpu::util::DeviceExt;
 pub struct Inst {
     pub rect: [f32; 4],
     pub color: [f32; 4],
+    /// kind (FIELD / PARTICLE), glow radius (pt), transition role (STATIC / INCOMING / OUTGOING), unused.
     pub p: [f32; 4],
+    /// Title strip height (pt), hover 0..1, tone 0..1, unused.
     pub q: [f32; 4],
-    /// x = transition role (STATIC / INCOMING / OUTGOING), yzw unused.
-    pub o: [f32; 4],
     /// Label box (screen min.xy, max.xy): dots under and around it stay dim. NO_TEXT = none.
     pub t: [f32; 4],
 }
 
 pub const NO_TEXT: [f32; 4] = [0.0, 0.0, -1.0, -1.0];
 
-pub const STATIC: [f32; 4] = [0.0; 4];
+pub const STATIC: f32 = 0.0;
 pub const INCOMING: f32 = 1.0;
 pub const OUTGOING: f32 = 2.0;
 /// Wave uniform (origin.xy, max dist, K), wave rect, (progress outside rect). K > 1: settled.
@@ -37,8 +37,7 @@ struct Uniform {
     origin: [f32; 2],
     size: [f32; 2],
     ppp: f32,
-    time: f32,
-    _pad: [f32; 2],
+    _pad: [f32; 3],
     wave: Wave,
 }
 
@@ -106,7 +105,7 @@ pub fn init(rs: &RenderState) {
             buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: size_of::<Inst>() as u64,
                 step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4],
+                attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4],
             })],
         },
         fragment: Some(wgpu::FragmentState {
@@ -140,7 +139,6 @@ fn inst_buf(dev: &wgpu::Device, cap: usize) -> wgpu::Buffer {
 struct Draw {
     insts: Vec<Inst>,
     rect: egui::Rect,
-    time: f32,
     slot: usize,
     wave: Wave,
 }
@@ -168,8 +166,7 @@ impl CallbackTrait for Draw {
             origin: self.rect.min.into(),
             size: self.rect.size().into(),
             ppp: sd.pixels_per_point,
-            time: self.time,
-            _pad: [0.0; 2],
+            _pad: [0.0; 3],
             wave: self.wave,
         };
         queue.write_buffer(&r.ubuf, 0, bytemuck::bytes_of(&u));
@@ -188,11 +185,11 @@ impl CallbackTrait for Draw {
 }
 
 /// `slot` must be unique per callback within a frame. The painter's clip rect becomes the scissor.
-pub fn paint(painter: &egui::Painter, rect: egui::Rect, insts: Vec<Inst>, time: f32, slot: usize, wave: Wave) {
-    painter.add(shape(rect, insts, time, slot, wave));
+pub fn paint(painter: &egui::Painter, rect: egui::Rect, insts: Vec<Inst>, slot: usize, wave: Wave) {
+    painter.add(shape(rect, insts, slot, wave));
 }
 
 /// The paint callback as a shape, for callers that reserve its place in the paint order first.
-pub fn shape(rect: egui::Rect, insts: Vec<Inst>, time: f32, slot: usize, wave: Wave) -> egui::Shape {
-    egui_wgpu::Callback::new_paint_callback(rect, Draw { insts, rect, time, slot, wave }).into()
+pub fn shape(rect: egui::Rect, insts: Vec<Inst>, slot: usize, wave: Wave) -> egui::Shape {
+    egui_wgpu::Callback::new_paint_callback(rect, Draw { insts, rect, slot, wave }).into()
 }

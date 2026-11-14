@@ -6,9 +6,9 @@ use std::path::Path;
 use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetLogicalDrives};
 use windows_sys::Win32::UI::Shell::{
-    FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, SHFILEOPSTRUCTW, SHFileOperationW, ShellExecuteW,
+    FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_WANTNUKEWARNING, SHFILEOPSTRUCTW, SHFileOperationW, ShellExecuteW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MessageBoxW, SW_SHOWNORMAL};
 
 fn wide(s: &Path) -> Vec<u16> {
     s.as_os_str().encode_wide().chain([0, 0]).collect() // double NUL: SHFileOperation list format
@@ -46,7 +46,9 @@ pub fn recycle(p: &Path) -> bool {
     let mut op: SHFILEOPSTRUCTW = unsafe { std::mem::zeroed() };
     op.wFunc = FO_DELETE;
     op.pFrom = w.as_ptr();
-    op.fFlags = (FOF_ALLOWUNDO | FOF_NOCONFIRMATION) as u16;
+    // WANTNUKEWARNING: Windows still asks before deleting for good what the bin cannot take (too
+    // big, or a drive without one), which NOCONFIRMATION alone would do silently.
+    op.fFlags = (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING) as u16;
     unsafe { SHFileOperationW(&mut op) == 0 && op.fAnyOperationsAborted == 0 }
 }
 
@@ -56,6 +58,12 @@ pub fn open(p: &Path) {
     unsafe {
         ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), w.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL)
     };
+}
+
+/// The app has no console: tell the user why it could not start.
+pub fn error_box(msg: &str) {
+    let z = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    unsafe { MessageBoxW(std::ptr::null_mut(), z(msg).as_ptr(), z("SpaceSniffer-rs").as_ptr(), MB_ICONERROR) };
 }
 
 pub fn reveal(p: &Path) {
