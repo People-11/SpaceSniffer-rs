@@ -1,5 +1,5 @@
 // One instance = one rounded rect. The fragment shader procedurally draws the dot-matrix
-// "pixel field" (5 levels, ordered dither) and the particles' additive glow.
+// "pixel field" (5 levels, ordered dither); particles are single dots of it.
 //
 // Transitions are done by the dot matrix itself (no alpha cross-fades): a wave sweeps from the
 // click point; as it passes, each dot cell flips from the old layer to the new one in place. The
@@ -21,8 +21,8 @@ struct U {
 
 struct Inst {
     @location(0) rect: vec4f,  // min.xy, max.xy (points, screen space)
-    @location(1) color: vec4f, // rgb, intensity
-    @location(2) p: vec4f,     // kind, glow radius(pt) | field: 1 = no gutter, first and last transition layer
+    @location(1) color: vec4f, // rgb, intensity (particles: level 0..4)
+    @location(2) p: vec4f,     // kind, field: 1 = no gutter, first and last transition layer
     @location(3) q: vec4f,     // header h(pt), hover, tone (0..1), label visibility (0..1)
     @location(4) t: vec4f,     // label box (min.xy, max.xy); empty = none
 };
@@ -43,8 +43,7 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> V {
         vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(0.0, 1.0),
         vec2f(0.0, 1.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0),
     );
-    let g = select(0.0, i.p.y, u32(i.p.x) == 2u);
-    let pt = mix(i.rect.xy - g, i.rect.zw + g, corners[vi]);
+    let pt = mix(i.rect.xy, i.rect.zw, corners[vi]);
     let ndc = (pt - u.origin) / u.size * 2.0 - 1.0;
     var o: V;
     o.pos = vec4f(ndc.x, -ndc.y, 0.0, 1.0);
@@ -64,9 +63,9 @@ fn bayer4(c: vec2f) -> f32 {
     return (m[i] + 0.5) / 16.0;
 }
 
-fn sd_box(p: vec2f, half: vec2f, r: f32) -> f32 {
-    let q = abs(p) - half + r;
-    return length(max(q, vec2f(0.0))) + min(max(q.x, q.y), 0.0) - r;
+// Colour of a dot at `level` (0..4) of a tile coloured `col`.
+fn shade(col: vec3f, level: f32) -> vec3f {
+    return col * (0.07 + 0.93 * pow(level / 4.0, 1.6));
 }
 
 // Must match WAVE_COOL in app.rs: how long (in progress units) a flipped cell stays hot.
@@ -78,8 +77,12 @@ const COOL: f32 = 0.3;
 fn wave_e(i: u32, p: vec2f, cs: f32) -> f32 {
     let w = u.w[i * 3u];
     let r = u.w[i * 3u + 1u];
-    if (any(p < r.xy) || any(p > r.zw)) { return select(-1.0, COOL, u.w[i * 3u + 2u].x > 0.5); }
-    let d = clamp(length(p - w.xy) / max(w.z, 1.0), 0.0, 1.0);
+    let x = u.w[i * 3u + 2u];
+    if (any(p < r.xy) || any(p > r.zw)) { return select(-1.0, COOL, x.x > 0.5); }
+    // Where p lies along the front's path, 0..1 (Shape in app.rs): a ring spreading out from the
+    // origin, or (1) closing in on it from the corners.
+    let d0 = clamp(length(p - w.xy) / max(w.z, 1.0), 0.0, 1.0);
+    let d = select(d0, 1.0 - d0, x.y > 0.5);
     // The band fades in with distance so the click point itself reacts on the very first frame.
     let thr = d * 0.8 + bayer4(floor(p * u.ppp / cs)) * 0.2 * min(d * 4.0, 1.0);
     return w.w * (1.0 + COOL) - thr;
@@ -88,7 +91,6 @@ fn wave_e(i: u32, p: vec2f, cs: f32) -> f32 {
 @fragment
 fn fs(v: V) -> @location(0) vec4f {
     let kind = u32(v.p.x);
-    let glow = select(0.0, v.p.y, kind == 2u);
     let col = v.color.rgb;
     let inten = v.color.a;
     let hover = v.q.y;
@@ -126,17 +128,8 @@ fn fs(v: V) -> @location(0) vec4f {
         }
     }
 
-    let half = (v.rect.zw - v.rect.xy) * 0.5;
-    let d = sd_box(v.pt - (v.rect.xy + v.rect.zw) * 0.5, half, 0.0);
-    // Glow outside the rect: alpha 0 => additive under premultiplied blending.
-    if (d > 0.0) {
-        if (glow <= 0.0) { discard; }
-        let a = 0.55 * inten * exp(-d / (glow * 0.33)) * (1.0 - smoothstep(glow * 0.7, glow, d));
-        return vec4f(col * a, 0.0);
-    }
-
-    if (kind == 2u) { // particle: additive solid square
-        return vec4f(col * inten, 0.0);
+    if (kind == 2u) { // particle: one dot, at its level
+        return vec4f(shade(col, inten), 1.0);
     }
 
     // Quiet zone: the dots under a label and one dot around it turn into title strip dots (below),
@@ -182,7 +175,5 @@ fn fs(v: V) -> @location(0) vec4f {
     // Tiles in a folder's block of small ones (p.y = 1) have none: the block has it.
     let own = kind == 0u && v.p.y < 0.5 && min(ts.x, ts.y) >= 3.0;
     if ((own && min(rd.x, rd.y) < 0.5) || body) { level = 0.0; }
-    var rgb = col * (0.07 + 0.93 * pow(level / 4.0, 1.6));
-    rgb *= (1.0 + 0.5 * born * born) * inten; // highlight at the wave front: brighter, same colour
-    return vec4f(rgb, 1.0);
+    return vec4f(shade(col, level) * inten, 1.0);
 }

@@ -14,7 +14,7 @@ use std::time::Instant;
 const BG: Color32 = Color32::from_rgb(11, 12, 15);
 const CARD: Color32 = Color32::from_rgb(21, 22, 26);
 const TEXT_DIM: Color32 = Color32::from_rgb(140, 144, 152);
-const MAX_PARTICLES: usize = 8000;
+const MAX_PARTICLES: usize = 30000;
 /// Transition lengths: in-place expand/collapse must feel instant, zooms carry more motion.
 const LOCAL_SECS: f32 = 0.6;
 const ZOOM_SECS: f32 = 0.65;
@@ -229,7 +229,8 @@ impl Anim {
     fn waves(&self, cams: &[Map], now: f32) -> Vec<Wave> {
         let w = |(s, &c): (&Step, &Map)| {
             let (origin, rect) = (apply(c, s.origin), apply_rect(c, s.rect));
-            Wave { origin, maxd: far_corner(origin, rect), k: s.k(now).clamp(0.0, 1.0), rect, outside: s.outside }
+            let shape = if s.outside { Shape::Gather } else { Shape::Spread };
+            Wave { origin, maxd: far_corner(origin, rect), k: s.k(now).clamp(0.0, 1.0), rect, outside: s.outside, shape }
         };
         self.steps.iter().zip(&cams[1..]).map(w).collect()
     }
@@ -263,23 +264,40 @@ struct Wave {
     k: f32,
     rect: Rect,
     outside: bool,
+    shape: Shape,
+}
+
+/// How a wave's front travels (must match `wave_e()` in shader.wgsl).
+#[derive(Clone, Copy, PartialEq)]
+enum Shape {
+    /// A ring spreading out from its origin (zoom in, expand / collapse, jumps).
+    Spread,
+    /// A ring closing in on its origin from the region's corners (zoom out: the old view is
+    /// drawn back in).
+    Gather,
 }
 
 impl Wave {
+    /// 0 at the start of the front's path, 1 where it ends.
+    fn dist(&self, p: Pos2) -> f32 {
+        let d = ((p - self.origin).length() / self.maxd.max(1.0)).clamp(0.0, 1.0);
+        if self.shape == Shape::Gather { 1.0 - d } else { d }
+    }
+
     /// < 0: the front has not reached `p` yet; >= 0: flipped `e` progress units ago.
     fn at(&self, p: Pos2, jitter: f32) -> f32 {
         if !self.rect.contains(p) {
             return if self.outside { WAVE_COOL } else { -1.0 };
         }
         // Jitter fades in with distance so the click point itself reacts on the very first frame.
-        let d = ((p - self.origin).length() / self.maxd.max(1.0)).clamp(0.0, 1.0);
+        let d = self.dist(p);
         let thr = d * 0.8 + jitter * 0.2 * (d * 4.0).min(1.0);
         self.k * (1.0 + WAVE_COOL) - thr
     }
 
     fn gpu(&self) -> gfx::Wave {
         let r = self.rect;
-        [[self.origin.x, self.origin.y, self.maxd, self.k], [r.min.x, r.min.y, r.max.x, r.max.y], [self.outside as u8 as f32, 0.0, 0.0, 0.0]]
+        [[self.origin.x, self.origin.y, self.maxd, self.k], [r.min.x, r.min.y, r.max.x, r.max.y], [self.outside as u8 as f32, self.shape as u8 as f32, 0.0, 0.0]]
     }
 }
 
@@ -322,6 +340,7 @@ fn typed(text: &str, f: f32) -> String {
     text.chars().take((n as f32 * f).ceil() as usize).collect()
 }
 
+/// One dot of a deleted tile, drifting up on the lattice and dimming level by level.
 struct Particle {
     pos: Pos2,
     vel: Vec2,
@@ -329,7 +348,8 @@ struct Particle {
     max: f32,
     delay: f32,
     col: [f32; 3],
-    size: f32,
+    /// Level it starts at (of the pixel field's 5).
+    level: f32,
 }
 
 struct Label {
@@ -618,24 +638,25 @@ impl App {
         self.status = format!("Moved to Recycle Bin: {} ({})", path.display(), fmt_size(freed));
     }
 
-    /// Dissolve a rect into rising particles, right edge first (like the reference "clear caches").
+    /// Dissolve a rect into its dots, rising and dimming, right edge first.
     fn burst(&mut self, r: Rect, col: [f32; 3]) {
-        let step = (r.area() / 2500.0).sqrt().max(3.0);
+        // Whole dots of the lattice, thinned out on big tiles to stay within MAX_PARTICLES.
+        let p = self.pitch;
+        let step = ((r.area() / (p * p) / 12000.0).sqrt().ceil().max(1.0)) * p;
         let mut y = r.min.y;
         while y < r.max.y {
             let mut x = r.min.x;
             while x < r.max.x {
                 if self.rand() < 0.7 && self.particles.len() < MAX_PARTICLES {
                     let (a, b, c, d) = (self.rand(), self.rand(), self.rand(), self.rand());
-                    let w = (0.3 + 0.7 * d) * 0.45;
                     self.particles.push(Particle {
                         pos: pos2(x, y),
                         vel: vec2((a - 0.5) * 50.0, -20.0 - b * 90.0),
                         life: 0.6 + c * 1.2,
                         max: 0.6 + c * 1.2,
                         delay: (r.max.x - x) / r.width().max(1.0) * 0.5,
-                        col: col.map(|v| v + (1.0 - v) * w),
-                        size: 1.5 + d * 2.0,
+                        col,
+                        level: if d < 0.5 { 4.0 } else { 3.0 },
                     });
                 }
                 x += step;
@@ -657,13 +678,15 @@ impl App {
             p.pos += p.vel * dt;
             p.life > 0.0
         });
+        let pitch = self.pitch;
         for p in self.particles.iter().filter(|p| p.delay <= 0.0) {
-            let k = (p.life / p.max).clamp(0.0, 1.0);
-            let s = p.size * 0.5;
+            // The dot cell it is over, at a level stepping down as it dies.
+            let level = (p.level * (p.life / p.max).clamp(0.0, 1.0)).ceil();
+            let c = (p.pos.to_vec2() / pitch).floor() * pitch;
             out.push(Inst {
-                rect: [p.pos.x - s, p.pos.y - s, p.pos.x + s, p.pos.y + s],
-                color: [p.col[0], p.col[1], p.col[2], k * k * 1.4],
-                p: [gfx::PARTICLE, 3.0, 0.0, 0.0],
+                rect: [c.x, c.y, c.x + pitch, c.y + pitch],
+                color: [p.col[0], p.col[1], p.col[2], level],
+                p: [gfx::PARTICLE, 0.0, 0.0, 0.0],
                 q: [0.0; 4],
                 t: gfx::NO_TEXT,
             });
@@ -1359,13 +1382,17 @@ mod tests {
     fn wave_and_typing() {
         let r = Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 100.0));
         let o = pos2(0.0, 0.0);
-        let w = |k| Wave { origin: o, maxd: far_corner(o, r), k, rect: r, outside: false };
+        let w = |k| Wave { origin: o, maxd: far_corner(o, r), k, rect: r, outside: false, shape: Shape::Spread };
         assert!(w(0.0).at(pos2(50.0, 50.0), 0.5) < 0.0);
         // Everything has flipped and fully cooled by the end, even the far corner.
         assert!(w(1.0).at(pos2(99.0, 99.0), 1.0) >= WAVE_COOL);
         assert!(w(0.0).at(pos2(0.0, 0.0), 0.0) >= 0.0, "the click point flips on the first frame");
         assert!(w(0.4).at(pos2(5.0, 5.0), 0.0) > w(0.4).at(pos2(90.0, 90.0), 0.0));
         assert!(w(0.9).at(pos2(150.0, 0.0), 0.0) < 0.0);
+        // A gathering front starts at the corners and ends at its origin.
+        let c = r.center();
+        let g = Wave { origin: c, maxd: far_corner(c, r), k: 0.0, rect: r, outside: false, shape: Shape::Gather };
+        assert!(g.dist(pos2(0.0, 0.0)) < 0.01 && g.dist(c) > 0.99);
         // Incoming (layer 1 of 2) types in as its cells cool.
         assert_eq!(typed("abcd", shown(&[0.0], 1, 1).0), "");
         assert_eq!(typed("abcd", shown(&[WAVE_COOL * 0.5], 1, 1).0), "ab");
