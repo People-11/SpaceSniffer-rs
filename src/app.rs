@@ -742,9 +742,9 @@ impl App {
                 ui.add_space(14.0);
                 // Drives as pixel-field blocks like the treemap's folders: title strip, used space lit,
                 // free space dim; a gap between drives instead of borders.
-                let gap = 2.0 * pitch;
+                let gap = (6.0 / pitch).round() * pitch;
                 let cols = self.drives.len().clamp(1, 3) as f32;
-                let size = vec2(((ui.available_width() - (cols - 1.0) * gap) / cols / pitch).floor() * pitch, header + 20.0 * pitch);
+                let size = vec2(((ui.available_width() - (cols - 1.0) * gap) / cols / pitch).floor() * pitch, header + (60.0 / pitch).round() * pitch);
                 let mut insts = vec![];
                 // Pixel fields go under the names: reserve their place in the paint order.
                 let field = ui.painter().add(egui::Shape::Noop);

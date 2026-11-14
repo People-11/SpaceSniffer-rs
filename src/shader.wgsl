@@ -103,8 +103,8 @@ fn fs(v: V) -> @location(0) vec4f {
 
     // Dot lattice fixed to the screen, in physical pixels: like an LED matrix, the dots never
     // move or scale; zooming tiles slide their colours across it. Tiles at rest sit exactly on it.
-    // ~3pt dot pitch (4px at 150% scaling), dots fill their cell with no gap.
-    let cs = max(3.0, floor(3.0 * u.ppp)); // = layout::grid() * ppp
+    // ~2pt dot pitch (3px at 150% scaling), dots fill their cell with no gap.
+    let cs = max(2.0, floor(2.0 * u.ppp)); // = layout::grid() * ppp
     let gp = v.pt * u.ppp;
     let cell = floor(gp / cs);
     // Transition: each screen cell belongs to exactly one layer (both layers evaluate the same
@@ -163,7 +163,7 @@ fn fs(v: V) -> @location(0) vec4f {
     var level = fl + step(bayer4(cell), clamp(n - fl, 0.15, 0.85));
     // Gutter: the top row and left column of every tile big enough to spare them, so each shared
     // edge is one dark line; smaller tiles are told apart by their pattern alone.
-    if (min(ts.x, ts.y) >= 4.0 && min(rd.x, rd.y) < 0.5) { level = 0.0; }
+    if (min(ts.x, ts.y) >= 3.0 && min(rd.x, rd.y) < 0.5) { level = 0.0; }
     var rgb = col * (0.07 + 0.93 * pow(level / 4.0, 1.6));
     rgb *= inten;
 

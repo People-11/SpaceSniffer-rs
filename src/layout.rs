@@ -5,9 +5,9 @@ use crate::tree::{Item, Tree};
 use std::collections::{HashMap, HashSet};
 use eframe::egui::{Rect, pos2, vec2};
 
-/// Dot pitch in points; must match `cs` in shader.wgsl (3pt rounded down to whole pixels).
+/// Dot pitch in points; must match `cs` in shader.wgsl (2pt rounded down to whole pixels).
 pub fn grid(ppp: f32) -> f32 {
-    (3.0 * ppp).floor().max(3.0) / ppp
+    (2.0 * ppp).floor().max(2.0) / ppp
 }
 
 /// Folder title strip height: ~15pt, a whole number of dot rows.
