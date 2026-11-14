@@ -1195,7 +1195,8 @@ impl App {
                 hi,
                 fixed,
                 clip: r.shrink(2.0),
-                pos: r.center(),
+                // Centred on what shows of the tile: its own gutter (top row, left column) is not.
+                pos: r.center() + Vec2::splat(if tile.solid { 0.0 } else { self.pitch * 0.5 }),
                 text: name.to_string(),
                 sub: fmt_size(size),
                 room: lr.shrink(3.0).size(),
