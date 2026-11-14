@@ -1,5 +1,5 @@
 // One instance = one rounded rect. The fragment shader procedurally draws the dot-matrix
-// "pixel field", twinkling lit dots, the white-hot discovery flash and additive glow.
+// "pixel field" (5 levels, ordered dither), the white-hot discovery flash and additive glow.
 //
 // Transitions are done by the dot matrix itself (no alpha cross-fades): a wave sweeps from the
 // click point; as it passes, each dot cell flips from the old layer to the new one in place, the
@@ -20,8 +20,8 @@ struct U {
 struct Inst {
     @location(0) rect: vec4f,  // min.xy, max.xy (points, screen space)
     @location(1) color: vec4f, // rgb, intensity
-    @location(2) p: vec4f,     // age(s), seed, kind, glow radius(pt)
-    @location(3) q: vec4f,     // header h(pt), hover, tone (0..1), lit density
+    @location(2) p: vec4f,     // age(s), unused, kind, glow radius(pt)
+    @location(3) q: vec4f,     // header h(pt), hover, tone (0..1), unused
     @location(4) o: vec4f,     // role: 0 static, 1 incoming, 2 outgoing; y: hover tone equalisation
     @location(5) t: vec4f,     // label box (min.xy, max.xy); empty = none
 };
@@ -64,6 +64,13 @@ fn hash(p: vec2f) -> f32 {
     return f32(n) / 4294967295.0;
 }
 
+// 4x4 Bayer threshold of a dot cell, in (0, 1).
+fn bayer4(c: vec2f) -> f32 {
+    var m = array<f32, 16>(0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
+    let i = (u32(c.y) & 3u) * 4u + (u32(c.x) & 3u);
+    return (m[i] + 0.5) / 16.0;
+}
+
 fn sd_box(p: vec2f, half: vec2f, r: f32) -> f32 {
     let q = abs(p) - half + r;
     return length(max(q, vec2f(0.0))) + min(max(q.x, q.y), 0.0) - r;
@@ -87,7 +94,6 @@ fn wave_e(p: vec2f, cs: f32) -> f32 {
 @fragment
 fn fs(v: V) -> @location(0) vec4f {
     let age = v.p.x;
-    let seed = v.p.y;
     let kind = u32(v.p.z);
     let glow = v.p.w;
     let col = v.color.rgb;
@@ -97,15 +103,10 @@ fn fs(v: V) -> @location(0) vec4f {
 
     // Dot lattice fixed to the screen, in physical pixels: like an LED matrix, the dots never
     // move or scale; zooming tiles slide their colours across it. Tiles at rest sit exactly on it.
-    // ~3pt dot pitch: a 3px dot + 1px gap at 150% scaling.
+    // ~3pt dot pitch (4px at 150% scaling), dots fill their cell with no gap.
     let cs = max(3.0, floor(3.0 * u.ppp)); // = layout::grid() * ppp
     let gp = v.pt * u.ppp;
     let cell = floor(gp / cs);
-    let f = gp - cell * cs;
-
-    let hd = (cs - 1.0) * 0.5;
-    let dq = abs(f - hd);
-    let dot = clamp(hd + 0.5 - max(dq.x, dq.y), 0.0, 1.0);
     // Transition: each screen cell belongs to exactly one layer (both layers evaluate the same
     // cell centre), so the two never overlap or leave a hole, even while the camera zooms.
     var born = 0.0;
@@ -114,7 +115,7 @@ fn fs(v: V) -> @location(0) vec4f {
         let e = wave_e(sc, cs);
         if ((role == 2u) == (e >= 0.0)) { discard; }
         let c = 1.0 - clamp(e / COOL, 0.0, 1.0);
-        born = select(0.0, c * c, role == 1u) * dot;
+        born = select(0.0, c * c, role == 1u);
     }
 
     let half = (v.rect.zw - v.rect.xy) * 0.5;
@@ -133,45 +134,40 @@ fn fs(v: V) -> @location(0) vec4f {
         return vec4f(col * inten, 0.0);
     }
 
-    let h = hash(cell + vec2f(seed * 131.0, seed * 71.0));
-    let h2 = hash(cell.yx + vec2f(seed * 17.0 + 3.0, 911.0));
-
-    // Lit dots: uniformly random over the tile, twinkling.
-    let density = v.q.w * 0.9;
-    // Every dot flickers on its own clock: time is cut into per-dot slots and each slot re-rolls
-    // whether the dot lights, so over time any dot can light up (no fixed lit set).
-    // Slow, so labels on top stay readable.
-    let tt = u.time * (0.15 + h2 * 0.3) + h * 17.0;
-    let slot = floor(tt);
-    let roll = hash(cell + vec2f(slot * 1.618 + seed * 13.0, slot * 2.414 + 5.0));
-    // Quiet zone: whole dots under a label and up to 2 dots around it are dimmed (they still
-    // twinkle), so the text always sits on a dark patch.
+    // Quiet zone: dots under a label and up to 2 dots around it are dimmed, so the text always
+    // sits on a dark patch.
     var quiet = 0.0;
     if (v.t.z > v.t.x) {
         let cc = (cell + 0.5) * cs / u.ppp;
         let out = max(v.t.xy - cc, cc - v.t.zw);
         quiet = clamp(1.0 - max(out.x, out.y) / (2.0 * cs / u.ppp), 0.0, 1.0);
     }
-    let lit = step(roll, density * 1.3) * sin(3.14159265 * fract(tt));
 
-    // Per-tile tone (colour, background and unlit dot level together): with no outlines this is
-    // what splits neighbouring tiles (layout gives edge neighbours different tones). Open folders use the same
-    // field, so space left by children too small to lay out still reads as dots, not a hole.
-    // A directly hovered tile eases to the top tone first, so all of them reach the same brightness.
-    let tone = mix(v.q.z, 1.0, v.o.y);
-    // Unlit-dot level is evenly spaced across the 4 tones (~20/46/71/97 of 255) so every step reads.
-    let base = col * (0.7 + 0.5 * tone);
-    let unlit = col * (0.08 + 0.30 * tone);
-    var rgb = col * (0.01 + 0.05 * tone) + dot * mix(unlit, base, lit) * (1.0 - 0.6 * quiet);
-    // Directory header strip.
-    if (v.pt.y < v.rect.y + v.q.x) { rgb = base * 0.16 + vec3f(0.03); }
+    // Ordered dither: every dot takes one of 5 levels. A tile's value picks the mix of two adjacent
+    // levels through a 4x4 Bayer matrix, so tones read as regular patterns instead of noise.
+    // Layout gives edge neighbours different tones; a directly hovered tile eases to one target.
+    let tone = v.q.z;
+    let eq = v.o.y;
+    let org = round(v.rect.xy * u.ppp / cs);
+    let ts = max(round((v.rect.zw - v.rect.xy) * u.ppp / cs), vec2f(1.0));
+    let rd = cell - org;
+    // The 4 tones sit between two levels (25 % / 75 % mixes: 1.25, 1.75, 2.25, 2.75), never on
+    // one, so no tile turns into a solid block; a slight top-left light varies the pattern.
+    let g = 1.0 - (rd.x / ts.x + rd.y / ts.y) * 0.5;
+    var n = 1.25 + 0.5 * round(tone * 3.0) + (g - 0.5) * 0.2;
+    n = mix(n, 3.5, eq) + 0.8 * max(hover - eq, 0.0);
+    n *= 1.0 - 0.8 * quiet;
+    // Directory header strip: sparse and dark under its title.
+    if (v.pt.y < v.rect.y + v.q.x) { n = 0.4 + 0.6 * hover; }
+    let fl = min(floor(n), 3.0);
+    var level = fl + step(bayer4(cell), clamp(n - fl, 0.15, 0.85));
+    // Gutter: the top row and left column of every tile big enough to spare them, so each shared
+    // edge is one dark line; smaller tiles are told apart by their pattern alone.
+    if (min(ts.x, ts.y) >= 4.0 && min(rd.x, rd.y) < 0.5) { level = 0.0; }
+    var rgb = col * (0.07 + 0.93 * pow(level / 4.0, 1.6));
     rgb *= inten;
 
-    // No outlines: neighbouring tiles are told apart by their (per-tile varied) colour alone.
-
     // White-hot: discovery flash and newborn transition dots.
-    rgb = mix(rgb, vec3f(1.0), max(hot * mix(0.2, 0.55, dot), born * 0.5));
-    // Hover: the whole tile (dots and background) lifts in brightness.
-    rgb = rgb * (1.0 + hover * 0.6) + col * hover * 0.07;
+    rgb = mix(rgb, vec3f(1.0), max(hot * 0.55, born * 0.5));
     return vec4f(rgb, 1.0);
 }

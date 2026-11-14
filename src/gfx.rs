@@ -13,7 +13,7 @@ pub struct Inst {
     pub color: [f32; 4],
     pub p: [f32; 4],
     pub q: [f32; 4],
-    /// x = transition role (STATIC / INCOMING / OUTGOING), y = hover tone equalisation; zw unused.
+    /// x = transition role (STATIC / INCOMING / OUTGOING), y = direct hover (eases to one target level); zw unused.
     pub o: [f32; 4],
     /// Label box (screen min.xy, max.xy): dots under and around it stay dim. NO_TEXT = none.
     pub t: [f32; 4],

@@ -21,7 +21,7 @@ const LOCAL_SECS: f32 = 0.6;
 const ZOOM_SECS: f32 = 0.65;
 const HOVER_SECS: f32 = 0.15;
 
-/// Every folder shares one color (SpaceSniffer-style sand); files are colored by type.
+/// Every folder shares one color (a warm copper); files are colored by type.
 const FOLDER_RGB: [f32; 3] = [184.0 / 255.0, 116.0 / 255.0, 66.0 / 255.0];
 
 fn rgb(c: u8) -> [f32; 3] {
@@ -43,15 +43,6 @@ pub fn fmt_size(b: u64) -> String {
         i += 1;
     }
     if i == 0 { format!("{b} B") } else { format!("{v:.1} {}", U[i]) }
-}
-
-fn seed(item: Item) -> f32 {
-    let (a, b) = match item {
-        Item::Dir(d) => (d, 0x9e37),
-        Item::File(d, f) => (d, f.wrapping_mul(0x85eb) ^ 0x51ed),
-    };
-    let h = (a.wrapping_mul(0x27d4eb2d) ^ b.wrapping_mul(0x165667b1)).wrapping_mul(0x9e3779b1);
-    (h >> 8) as f32 / (1u32 << 24) as f32
 }
 
 fn lerp_rect(a: Rect, b: Rect, k: f32) -> Rect {
@@ -86,6 +77,24 @@ fn find_rect(t: &Tree, tiles: &[Tile], mut d: u32) -> Option<Rect> {
         }
         d = t.dirs[d as usize].parent;
     }
+}
+
+/// Rect of dir `d` in the layout of `view`: its tile in `tiles`, or, when it has none (e.g. a
+/// back/forward target whose ancestor was folded since), where it would sit with the path down to
+/// it opened, so zooms start/end at its real size instead of the folded ancestor's.
+fn place(t: &Tree, tiles: &[Tile], view: u32, area: Rect, expanded: &HashSet<u32>, pitch: f32, d: u32) -> Option<Rect> {
+    if let Some(x) = tiles.iter().find(|x| x.item == Item::Dir(d)) {
+        return Some(x.rect);
+    }
+    let mut open = expanded.clone();
+    let mut a = t.dirs[d as usize].parent;
+    while a != view && a != 0 {
+        open.insert(a);
+        a = t.dirs[a as usize].parent;
+    }
+    let mut out = vec![];
+    layout::build(t, view, area, &open, pitch, tiles, &mut out);
+    find_rect(t, &out, d)
 }
 
 #[derive(Clone, Copy)]
@@ -358,6 +367,8 @@ pub struct App {
     /// Frame timestamps of the last second, and smoothed CPU time per frame (ms).
     frames: std::collections::VecDeque<Instant>,
     cpu_ms: f32,
+    /// When tiles were last discovered: their white-hot flash still cools for ~1s after.
+    born_t: f32,
 }
 
 impl App {
@@ -408,6 +419,7 @@ impl App {
             title: String::new(),
             frames: Default::default(),
             cpu_ms: 0.0,
+            born_t: 0.0,
         };
         if let Some(rs) = cc.wgpu_render_state.as_ref() {
             let i = rs.adapter.get_info();
@@ -496,7 +508,10 @@ impl App {
         // Bounded so a burst of batches never stalls a frame.
         while budget.elapsed().as_millis() < 8 {
             match scan.rx.try_recv() {
-                Ok(tree::Msg::Batch(b)) => t.apply(b, now),
+                Ok(tree::Msg::Batch(b)) => {
+                    t.apply(b, now);
+                    self.born_t = now;
+                }
                 Ok(tree::Msg::Done) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     done = true;
                     break;
@@ -735,16 +750,15 @@ impl App {
                 let field = ui.painter().add(egui::Shape::Noop);
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = vec2(gap, gap);
-                    for (i, (d, space)) in self.drives.iter().enumerate() {
+                    for (d, space) in &self.drives {
                         let (r, resp) = ui.allocate_exact_size(size, Sense::click());
                         let r = layout::snap(Rect::from_min_size(r.min, size), pitch);
                         let hov = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), HOVER_SECS);
-                        let seed = (i as f32 * 0.618 + 0.1).fract();
                         let block = |rect: Rect, inten: f32, head: f32| Inst {
                             rect: [rect.min.x, rect.min.y, rect.max.x, rect.max.y],
                             color: [FOLDER_RGB[0], FOLDER_RGB[1], FOLDER_RGB[2], inten],
-                            p: [99.0, seed, gfx::FIELD, 0.0],
-                            q: [head, hov, 0.5, 0.3],
+                            p: [99.0, 0.0, gfx::FIELD, 0.0],
+                            q: [head, hov, 0.5, 0.0],
                             o: gfx::STATIC,
                             t: gfx::NO_TEXT,
                         };
@@ -883,11 +897,11 @@ impl App {
                         let at = find_rect(t, &self.tiles, d).unwrap_or(area).center();
                         (Kind::Local { click: click.unwrap_or(at) }, Some(Item::Dir(d)))
                     } else if is_ancestor(t, from, to)
-                        && let Some(small) = find_rect(t, &old, to)
+                        && let Some(small) = place(t, &old, from, area, &self.expanded, self.pitch, to)
                     {
                         (Kind::In { small, click: click.filter(|p| small.contains(*p)).unwrap_or(small.center()) }, Some(Item::Dir(to)))
                     } else if is_ancestor(t, to, from)
-                        && let Some(small) = find_rect(t, &self.tiles, from)
+                        && let Some(small) = place(t, &self.tiles, to, area, &self.expanded, self.pitch, from)
                     {
                         (Kind::Out { small }, Some(Item::Dir(from)))
                     } else {
@@ -1174,8 +1188,8 @@ impl App {
         insts.push(Inst {
             rect: [r.min.x, r.min.y, r.max.x, r.max.y],
             color: [col[0], col[1], col[2], if dim { DIM } else { 1.0 }],
-            p: [age, seed(item), gfx::FIELD, glow],
-            q: [if tile.open { self.header } else { 0.0 }, hov, tile.tone as f32 / (layout::TONES - 1) as f32, 0.3],
+            p: [age, 0.0, gfx::FIELD, glow],
+            q: [if tile.open { self.header } else { 0.0 }, hov, tile.tone as f32 / (layout::TONES - 1) as f32, 0.0],
             o: [role, eq, 0.0, 0.0],
             t: gfx::NO_TEXT,
         });
@@ -1355,11 +1369,15 @@ impl eframe::App for App {
         }
 
         self.cpu_ms = self.cpu_ms * 0.9 + frame_t0.elapsed().as_secs_f32() * 1000.0 * 0.1;
-        if minimized {
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
-        } else {
-            // The pixel fields (treemap and drive picker) always twinkle.
-            ctx.request_repaint();
+        // The pixel field is static: keep drawing only while something moves (input repaints anyway).
+        let easing = self.hover_fx.iter().chain(&self.group_fx).any(|x| x.1 < 1.0);
+        let busy = self.scan.is_some() || self.anim.is_some() || !self.particles.is_empty() || easing || self.now() - self.born_t < 1.2;
+        if busy {
+            if minimized {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250)); // keep the scan flowing
+            } else {
+                ctx.request_repaint();
+            }
         }
     }
 }
