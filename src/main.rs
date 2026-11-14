@@ -1,8 +1,9 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(not(feature = "perf"), windows_subsystem = "windows")]
 
 mod app;
 mod gfx;
 mod layout;
+mod perf;
 mod tree;
 mod win;
 

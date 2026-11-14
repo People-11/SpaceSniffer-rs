@@ -80,6 +80,37 @@ pub enum Item {
     File(u32, u32),
 }
 
+/// Map keyed by item with FxHash instead of std's SipHash: layouts hash tens of thousands of
+/// items (some per frame), and the keys are our own indices, so there is nothing to guard against.
+pub type ItemMap<V> = std::collections::HashMap<Item, V, std::hash::BuildHasherDefault<Fx>>;
+
+#[derive(Default)]
+pub struct Fx(u64);
+
+impl Fx {
+    fn add(&mut self, x: u64) {
+        self.0 = (self.0.rotate_left(5) ^ x).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl std::hash::Hasher for Fx {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        bytes.iter().for_each(|&b| self.add(b as u64));
+    }
+    fn write_u32(&mut self, x: u32) {
+        self.add(x as u64);
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.add(x);
+    }
+    fn write_usize(&mut self, x: usize) {
+        self.add(x as u64);
+    }
+}
+
 pub struct Tree {
     pub dirs: Vec<Dir>,
     /// Bumped on every mutation; drives relayout.

@@ -13,22 +13,26 @@ struct U {
     ppp: f32,
     nw: f32,      // number of waves (0: no transition)
     cell0: vec2f, // first dot cell of the draw's texture (origin/size above cover its cells)
+    header: f32,  // title strip height (pt) of open folders
     // Per wave, 3 vec4s: origin.xy, max distance, progress K (0..1); region it acts on (min.xy,
     // max.xy); x = 1 if outside that region is new already (zoom out: the ring closes in).
     w: array<vec4f, 12>,
+    boxes: array<vec4f, 255>, // label boxes (min.xy, max.xy), indexed by an instance's p.y
 };
 @group(0) @binding(0) var<uniform> u: U;
 
+// Packed (see gfx::Inst); the vertex shader unpacks it into V.
 struct Inst {
     @location(0) rect: vec4f,  // min.xy, max.xy (points, screen space)
-    @location(1) color: vec4f, // rgb, intensity (particles: level 0..4)
-    @location(2) p: vec4f,     // kind, field: 1 = no gutter, first and last transition layer
-    @location(3) q: vec4f,     // header h(pt), hover, tone (0..1), label visibility (0..1)
-    @location(4) t: vec4f,     // label box (min.xy, max.xy); empty = none
+    @location(1) color: vec4f, // rgb, intensity (particles: level / 4)
+    @location(2) p: vec4u,     // kind | 4 no gutter | 8 open; label box (255: none); first and last transition layer
+    @location(3) q: vec4f,     // hover, tone (0..1), label visibility (0..1), unused
 };
 
 struct V {
     @builtin(position) pos: vec4f,
+    // color: rgb, intensity (particles: level 0..4); p: kind, 1 = no gutter, first and last
+    // transition layer; q: title strip height (pt), hover, tone, label visibility; t: label box.
     @location(0) pt: vec2f,
     @location(1) @interpolate(flat) rect: vec4f,
     @location(2) @interpolate(flat) color: vec4f,
@@ -49,10 +53,11 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> V {
     o.pos = vec4f(ndc.x, -ndc.y, 0.0, 1.0);
     o.pt = pt;
     o.rect = i.rect;
-    o.color = i.color;
-    o.p = i.p;
-    o.q = i.q;
-    o.t = i.t;
+    let kind = i.p.x & 3u;
+    o.color = vec4f(i.color.rgb, i.color.a * select(1.0, 4.0, kind == 2u));
+    o.p = vec4f(f32(kind), f32((i.p.x >> 2u) & 1u), f32(i.p.z), f32(i.p.w));
+    o.q = vec4f(select(0.0, u.header, (i.p.x & 8u) != 0u), i.q.x, i.q.y, i.q.z);
+    o.t = select(vec4f(0.0, 0.0, -1.0, -1.0), u.boxes[min(i.p.y, 254u)], i.p.y < 255u);
     return o;
 }
 

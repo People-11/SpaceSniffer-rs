@@ -1,8 +1,8 @@
 //! Nested squarified treemap, SpaceSniffer style: every directory gets a header strip
 //! ("name - size") and its children are laid out inside.
 
-use crate::tree::{Item, Tree};
-use std::collections::{HashMap, HashSet};
+use crate::tree::{Item, ItemMap, Tree};
+use std::collections::HashSet;
 use eframe::egui::{Rect, pos2, vec2};
 
 /// Dot pitch in points; must match `cs` in shader.wgsl (2pt rounded down to whole pixels).
@@ -22,6 +22,7 @@ pub fn snap(r: Rect, pitch: f32) -> Rect {
     Rect::from_min_max(pos2(s(r.min.x), s(r.min.y)), pos2(s(r.max.x), s(r.max.y)))
 }
 
+#[derive(Clone)]
 pub struct Tile {
     pub rect: Rect,
     pub item: Item,
@@ -33,6 +34,8 @@ pub struct Tile {
     pub tone: u8,
     /// In its folder's block of small tiles: no gutter of its own (the block has one).
     pub solid: bool,
+    /// A file's category (see `tree::CATS`), kept here so drawing never looks the file up.
+    pub cat: u8,
 }
 
 /// Does a folder named `name` at `r` get a title strip (and children)? Only if its name fits;
@@ -50,12 +53,20 @@ const DEFAULT_DEPTH: u16 = 2;
 /// `pitch`: dot lattice pitch in points (see [`grid`]); every rect is snapped to it.
 /// `prev`: the previous layout, whose tones are kept where possible.
 pub fn build(tree: &Tree, root: u32, area: Rect, expanded: &HashSet<u32>, pitch: f32, prev: &[Tile], out: &mut Vec<Tile>) {
+    {
+        let _s = crate::perf::span("dir");
+        rects(tree, root, area, expanded, pitch, u32::MAX, out);
+    }
+    let _s = crate::perf::span("tones");
+    tones(out, snap(area, pitch), pitch, prev);
+}
+
+/// The rects of [`build`] without tones, down to dir `stop` (which is not opened; u32::MAX:
+/// none): where `stop` would be, for a zoom from or to it.
+pub fn rects(tree: &Tree, root: u32, area: Rect, expanded: &HashSet<u32>, pitch: f32, stop: u32, out: &mut Vec<Tile>) {
     out.clear();
     if tree.dirs[root as usize].size > 0 {
-        let g = Grid { pitch, header: header(pitch) };
-        let area = snap(area, pitch);
-        dir(tree, root, area, 0, expanded, &g, out);
-        tones(out, area, pitch, prev);
+        dir(tree, root, snap(area, pitch), 0, expanded, &Grid { pitch, header: header(pitch), stop }, out);
     }
 }
 
@@ -86,15 +97,14 @@ fn tones(out: &mut [Tile], area: Rect, pitch: f32, prev: &[Tile]) {
         }
     }
     let mut tone = vec![u8::MAX; out.len()];
-    // Shared boundary length (in dots) with already-coloured neighbours, per neighbour tone.
-    let near = |i: usize, tone: &[u8]| {
+    // Every tile cell just outside tile i (one per dot of shared boundary).
+    let edge = |i: usize, f: &mut dyn FnMut(usize)| {
         let (x0, y0, x1, y1) = cells(&out[i]);
-        let mut w = [0.0f32; TONES as usize];
         let mut look = |x: isize, y: isize| {
             if (0..cols).contains(&x) && (0..rows).contains(&y) {
                 let j = map[(y * cols + x) as usize];
-                if j != u32::MAX && tone[j as usize] != u8::MAX {
-                    w[tone[j as usize] as usize] += 1.0;
+                if j != u32::MAX {
+                    f(j as usize);
                 }
             }
         };
@@ -106,6 +116,15 @@ fn tones(out: &mut [Tile], area: Rect, pitch: f32, prev: &[Tile]) {
             look(x0 - 1, y);
             look(x1, y);
         }
+    };
+    // Shared boundary length (in dots) with already-coloured neighbours, per neighbour tone.
+    let near = |i: usize, tone: &[u8]| {
+        let mut w = [0.0f32; TONES as usize];
+        edge(i, &mut |j| {
+            if tone[j] != u8::MAX {
+                w[tone[j] as usize] += 1.0;
+            }
+        });
         w
     };
     // Same-tone edge first (any clash-free tone wins), then how close the other neighbours' tones are.
@@ -113,10 +132,22 @@ fn tones(out: &mut [Tile], area: Rect, pitch: f32, prev: &[Tile]) {
     let best = |w: &[f32; TONES as usize]| (0..TONES).min_by(|&a, &b| cost(w, a).partial_cmp(&cost(w, b)).unwrap()).unwrap();
     // A tile that did not move keeps its tone whatever happens around it (so far-off blocks never
     // change colour when a folder opens); one that moved keeps it if that clashes with nothing.
-    let old: HashMap<Item, (u8, Rect)> = prev.iter().filter(|t| !t.open).map(|t| (t.item, (t.tone, t.rect))).collect();
+    // (tone, rect) in `prev` per tile; the map is built from the smaller of the two layouts.
+    let mut old: Vec<Option<(u8, Rect)>> = vec![None; out.len()];
+    if prev.len() <= order.len() {
+        let m: ItemMap<(u8, Rect)> = prev.iter().filter(|t| !t.open).map(|t| (t.item, (t.tone, t.rect))).collect();
+        order.iter().for_each(|&i| old[i] = m.get(&out[i].item).copied());
+    } else {
+        let m: ItemMap<usize> = order.iter().map(|&i| (out[i].item, i)).collect();
+        for t in prev.iter().filter(|t| !t.open) {
+            if let Some(&i) = m.get(&t.item) {
+                old[i] = Some((t.tone, t.rect));
+            }
+        }
+    }
     let mut still = vec![false; out.len()];
     for &i in &order {
-        if let Some(&(c, r)) = old.get(&out[i].item)
+        if let Some((c, r)) = old[i]
             && r == out[i].rect
         {
             tone[i] = c;
@@ -124,7 +155,7 @@ fn tones(out: &mut [Tile], area: Rect, pitch: f32, prev: &[Tile]) {
         }
     }
     for &i in &order {
-        if let Some(&(c, _)) = old.get(&out[i].item)
+        if let Some((c, _)) = old[i]
             && !still[i]
             && near(i, &tone)[c as usize] == 0.0
         {
@@ -136,20 +167,33 @@ fn tones(out: &mut [Tile], area: Rect, pitch: f32, prev: &[Tile]) {
             tone[i] = best(&near(i, &tone));
         }
     }
-    // Local repair: recolour wherever another tone clashes less, until nothing changes.
+    // Local repair: recolour wherever another tone clashes less, until nothing changes. A pass
+    // only revisits what a change in the one before can affect: the changed tiles and their
+    // neighbours (in `order`, as a full pass would).
+    let mut rank = vec![0; out.len()];
+    order.iter().enumerate().for_each(|(k, &i)| rank[i] = k);
+    let mut work: Vec<usize> = order.iter().copied().filter(|&i| !still[i]).collect();
     for _ in 0..4 {
-        let mut changed = false;
-        for &i in order.iter().filter(|&&i| !still[i]) {
+        let mut next = vec![];
+        for &i in &work {
             let w = near(i, &tone);
+            if w[tone[i] as usize] == 0.0 {
+                continue; // no clash: nothing to repair
+            }
             let c = best(&w);
-            if w[tone[i] as usize] > 0.0 && cost(&w, c) < cost(&w, tone[i]) {
+            if cost(&w, c) < cost(&w, tone[i]) {
                 tone[i] = c;
-                changed = true;
+                next.push(i);
+                edge(i, &mut |j| next.push(j));
             }
         }
-        if !changed {
+        if next.is_empty() {
             break;
         }
+        next.retain(|&i| !still[i]);
+        next.sort_unstable_by_key(|&i| rank[i]);
+        next.dedup();
+        work = next;
     }
     for &i in &order {
         out[i].tone = tone[i];
@@ -159,35 +203,37 @@ fn tones(out: &mut [Tile], area: Rect, pitch: f32, prev: &[Tile]) {
 struct Grid {
     pitch: f32,
     header: f32,
+    /// Dir left closed (see [`rects`]); u32::MAX: none.
+    stop: u32,
 }
 
 fn dir(tree: &Tree, d: u32, r: Rect, depth: u16, expanded: &HashSet<u32>, g: &Grid, out: &mut Vec<Tile>) {
     let idx = out.len();
     let x = &tree.dirs[d as usize];
     let has_title = depth == 0 || titled(&x.name, r, g.header); // the view root always opens
-    out.push(Tile { rect: r, item: Item::Dir(d), open: false, titled: has_title, tone: 0, solid: false });
+    out.push(Tile { rect: r, item: Item::Dir(d), open: false, titled: has_title, tone: 0, solid: false, cat: 0 });
     // Children fill everything below the title strip: no padding gutters.
     let inner = Rect::from_min_max(pos2(r.min.x, r.min.y + g.header), r.max);
     // Opens by default only if its name fits; a folder the user clicked opens regardless.
     let wanted = has_title && (depth <= DEFAULT_DEPTH || expanded.contains(&x.parent)) || expanded.contains(&d);
-    if !wanted || inner.width() < 12.0 || inner.height() < g.pitch {
+    if !wanted || d == g.stop || inner.width() < 12.0 || inner.height() < g.pitch {
         return;
     }
     out[idx].open = true;
+    // Children smaller than one dot are dropped (before sorting: a folder can hold a million files,
+    // a few thousand of which show); the rest are scaled up to fill the whole body, so no leftover
+    // patch of the folder's own field shows.
+    let area = (inner.width() * inner.height()) as f64;
+    let total = x.size as f64; // = its children's sizes
+    let dot = (g.pitch * g.pitch) as f64;
     let mut kids: Vec<(f64, Item)> = x
         .dirs
         .iter()
         .map(|&c| (tree.dirs[c as usize].size as f64, Item::Dir(c)))
         .chain(x.files.iter().enumerate().map(|(i, f)| (f.size as f64, Item::File(d, i as u32))))
-        .filter(|k| k.0 > 0.0)
+        .filter(|k| k.0 > 0.0 && k.0 * area / total >= dot)
         .collect();
     kids.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-    // Children smaller than one dot are dropped; the rest are scaled up to fill the whole body, so
-    // no leftover patch of the folder's own field shows.
-    let area = (inner.width() * inner.height()) as f64;
-    let total: f64 = kids.iter().map(|k| k.0).sum();
-    let dot = (g.pitch * g.pitch) as f64;
-    kids.truncate(kids.partition_point(|k| k.0 * area / total >= dot));
     let kept: f64 = kids.iter().map(|k| k.0).sum();
     for k in &mut kids {
         k.0 *= area / kept;
@@ -248,7 +294,7 @@ fn dir(tree: &Tree, d: u32, r: Rect, depth: u16, expanded: &HashSet<u32>, g: &Gr
         let at = out.len();
         match item {
             Item::Dir(c) => dir(tree, c, rect, depth + 1, expanded, g, out),
-            Item::File(..) => out.push(Tile { rect, item, open: false, titled: false, tone: 0, solid: false }),
+            Item::File(_, f) => out.push(Tile { rect, item, open: false, titled: false, tone: 0, solid: false, cat: x.files[f as usize].cat }),
         }
         out[at].solid = n >= solid;
     }

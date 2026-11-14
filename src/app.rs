@@ -1,13 +1,14 @@
 use crate::gfx::{self, Inst};
 use crate::layout::{self, Tile};
-use crate::tree::{self, CATS, Item, Tree};
+use crate::perf;
+use crate::tree::{self, CATS, Item, ItemMap, Tree};
 use crate::win;
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Key, Margin, PointerButton, Pos2, Rect, RichText, Sense, Vec2,
     pos2, vec2,
 };
 use eframe::egui_wgpu::SurfaceConfig;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -21,12 +22,7 @@ const ZOOM_SECS: f32 = 0.65;
 const HOVER_SECS: f32 = 0.15;
 
 /// Every folder shares one color (a warm copper); files are colored by type.
-const FOLDER_RGB: [f32; 3] = [184.0 / 255.0, 116.0 / 255.0, 66.0 / 255.0];
-
-fn rgb(c: u8) -> [f32; 3] {
-    let [r, g, b] = CATS[c as usize].1;
-    [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]
-}
+const FOLDER_RGB: [u8; 3] = [184, 116, 66];
 
 fn c32(c: u8) -> Color32 {
     let [r, g, b] = CATS[c as usize].1;
@@ -92,7 +88,7 @@ fn place(t: &Tree, tiles: &[Tile], view: u32, area: Rect, expanded: &HashSet<u32
         a = t.dirs[a as usize].parent;
     }
     let mut out = vec![];
-    layout::build(t, view, area, &open, pitch, tiles, &mut out);
+    layout::rects(t, view, area, &open, pitch, d, &mut out);
     find_rect(t, &out, d)
 }
 
@@ -189,8 +185,11 @@ struct Step {
     at: Option<At>,
 }
 
+/// What a layout depends on: (view, area, tree version, expand version).
+type LayoutKey = (u32, Rect, u64, u64);
+
 /// Tiles by item: (rect, open).
-type At = HashMap<Item, (Rect, bool)>;
+type At = ItemMap<(Rect, bool)>;
 
 fn index(tiles: &[Tile]) -> At {
     tiles.iter().map(|x| (x.item, (x.rect, x.open))).collect()
@@ -339,7 +338,7 @@ struct Particle {
     life: f32,
     max: f32,
     delay: f32,
-    col: [f32; 3],
+    col: [u8; 3],
     /// Level it starts at (of the pixel field's 5).
     level: f32,
 }
@@ -370,7 +369,9 @@ pub struct App {
     back: Vec<u32>,
     fwd: Vec<u32>,
     tiles: Vec<Tile>,
-    layout_key: (u32, Rect, u64, u64),
+    layout_key: LayoutKey,
+    /// Recent layouts by `layout_key`, newest first: back / forward between big folders reuses them.
+    built: Vec<(LayoutKey, Vec<Tile>)>,
     expanded: HashSet<u32>,
     expand_ver: u64,
     /// Where the user clicked: origin of the next transition wave.
@@ -428,6 +429,7 @@ impl App {
             fwd: vec![],
             tiles: vec![],
             layout_key: (u32::MAX, Rect::NOTHING, 0, 0),
+            built: vec![],
             expanded: HashSet::new(),
             expand_ver: 0,
             click_pos: None,
@@ -509,6 +511,7 @@ impl App {
         self.hover = None;
         self.tiles.clear();
         self.layout_key.0 = u32::MAX;
+        self.built.clear(); // a new tree's versions start over: its keys could match old layouts
         self.expanded.clear();
         self.anim = None;
     }
@@ -602,7 +605,7 @@ impl App {
         }
         let col = match item {
             Item::Dir(_) => FOLDER_RGB,
-            Item::File(d, f) => rgb(t.dirs[d as usize].files[f as usize].cat),
+            Item::File(d, f) => CATS[t.dirs[d as usize].files[f as usize].cat as usize].1,
         };
         let freed = t.size(item);
         if let Item::Dir(d) = item
@@ -613,6 +616,7 @@ impl App {
         t.remove(item);
         // File indices shift on delete: never morph across it.
         self.layout_key.0 = u32::MAX;
+        self.built.clear();
         self.anim = None;
         self.back.clear();
         self.fwd.clear();
@@ -631,7 +635,7 @@ impl App {
     }
 
     /// Dissolve a rect into its dots, rising and dimming, right edge first.
-    fn burst(&mut self, r: Rect, col: [f32; 3]) {
+    fn burst(&mut self, r: Rect, col: [u8; 3]) {
         // Whole dots of the lattice, thinned out on big tiles to stay within MAX_PARTICLES.
         let p = self.pitch;
         let step = ((r.area() / (p * p) / 12000.0).sqrt().ceil().max(1.0)) * p;
@@ -677,10 +681,9 @@ impl App {
             let c = (p.pos.to_vec2() / pitch).floor() * pitch;
             out.push(Inst {
                 rect: [c.x, c.y, c.x + pitch, c.y + pitch],
-                color: [p.col[0], p.col[1], p.col[2], level],
-                p: [gfx::PARTICLE, 0.0, 0.0, 0.0],
-                q: [0.0; 4],
-                t: gfx::NO_TEXT,
+                color: gfx::rgba(p.col, level / 4.0),
+                p: [gfx::PARTICLE, gfx::NO_LABEL, 0, 0],
+                q: [0; 4],
             });
         }
         out
@@ -783,23 +786,22 @@ impl App {
                         let (r, resp) = ui.allocate_exact_size(size, Sense::click());
                         let r = layout::snap(Rect::from_min_size(r.min, size), pitch);
                         let hov = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), HOVER_SECS);
-                        let block = |rect: Rect, inten: f32, head: f32| Inst {
+                        let block = |rect: Rect, inten: f32, open: bool| Inst {
                             rect: [rect.min.x, rect.min.y, rect.max.x, rect.max.y],
-                            color: [FOLDER_RGB[0], FOLDER_RGB[1], FOLDER_RGB[2], inten],
-                            p: [gfx::FIELD, 0.0, 0.0, 0.0],
-                            q: [head, hov, 0.5, 0.0],
-                            t: gfx::NO_TEXT,
+                            color: gfx::rgba(FOLDER_RGB, inten),
+                            p: [gfx::FIELD | if open { gfx::OPEN } else { 0 }, gfx::NO_LABEL, 0, 0],
+                            q: [gfx::unorm(hov), gfx::unorm(0.5), 0, 0],
                         };
                         let body = Rect::from_min_max(pos2(r.min.x, r.min.y + header), r.max);
-                        insts.push(block(Rect::from_min_max(r.min, pos2(r.max.x, body.min.y)), 1.0, header));
-                        insts.push(block(body, 0.3, 0.0));
+                        insts.push(block(Rect::from_min_max(r.min, pos2(r.max.x, body.min.y)), 1.0, true));
+                        insts.push(block(body, 0.3, false));
                         let name = d.trim_end_matches('\\');
                         let title = match space {
                             Some((tot, free)) => {
                                 let used = 1.0 - *free as f32 / (*tot).max(1) as f32;
                                 let fill = layout::snap(Rect::from_min_max(body.min, pos2(body.min.x + body.width() * used, body.max.y)), pitch);
                                 if fill.width() > 0.0 {
-                                    insts.push(block(fill, 1.0, 0.0));
+                                    insts.push(block(fill, 1.0, false));
                                 }
                                 format!("{name} - {} free", fmt_size(*free))
                             }
@@ -812,7 +814,7 @@ impl App {
                         }
                     }
                 });
-                ui.painter().set(field, gfx::shape(ui.clip_rect(), insts, 0, &[]));
+                ui.painter().set(field, gfx::shape(ui.clip_rect(), insts, vec![], 0, &[]));
                 ui.add_space(14.0);
                 // Path field + Start span exactly the row of drives above.
                 let row = vec2(cols * size.x + (cols - 1.0) * gap, 28.0);
@@ -846,6 +848,7 @@ impl App {
             self.pitch = pitch;
             self.header = layout::header(pitch);
             self.layout_key.0 = u32::MAX;
+            self.built.clear();
             self.anim = None;
         }
         let area = layout::snap(area.shrink(1.0), pitch);
@@ -907,7 +910,21 @@ impl App {
                     self.group_fx.clear();
                 }
                 let old = std::mem::take(&mut self.tiles);
-                layout::build(t, self.view, area, &self.expanded, self.pitch, &old, &mut self.tiles);
+                {
+                    let _s = perf::span("build");
+                    match self.built.iter().position(|b| b.0 == key) {
+                        Some(i) => self.tiles = self.built[i].1.clone(),
+                        None => {
+                            layout::build(t, self.view, area, &self.expanded, self.pitch, &old, &mut self.tiles);
+                            // Not while scanning: every frame is a new version then.
+                            if self.scan.is_none() {
+                                self.built.insert(0, (key, self.tiles.clone()));
+                                self.built.truncate(4);
+                            }
+                        }
+                    }
+                }
+                let _s = perf::span("anim-setup");
                 let animate = prev.0 != u32::MAX && key.1 == prev.1 && (key.0 != prev.0 || key.3 != prev.3);
                 if animate {
                     let (from, to) = (prev.0, self.view);
@@ -973,6 +990,7 @@ impl App {
         let t = self.tree.as_ref().unwrap();
         let mut insts = Vec::with_capacity(self.tiles.len() * 2 + 8);
         let mut labels = vec![];
+        let mut boxes = vec![];
         let (steps, cams, waves) = match &self.anim {
             Some(a) => {
                 let cams = a.cams(area, now);
@@ -981,7 +999,14 @@ impl App {
             }
             None => (&[][..], vec![(area, area)], vec![]),
         };
-        self.layers(t, steps, &cams, &mut insts, &mut labels);
+        {
+            let _s = perf::span("layers");
+            self.layers(t, steps, &cams, area, &mut insts, &mut labels);
+        }
+        perf::add("#tiles", self.tiles.len() as f64);
+        perf::add("#insts", insts.len() as f64);
+        perf::add("#labels", labels.len() as f64);
+        let labels_t = perf::span("labels");
         self.cam = *cams.last().unwrap();
         let painter = ui.painter().with_clip_rect(area.expand(1.0).intersect(ui.clip_rect()));
         // The pixel layer goes under the labels, but its quiet zones are only known once the labels
@@ -1026,15 +1051,20 @@ impl App {
                 continue;
             }
             let bx = Rect::from_center_size(l.pos, vec2(full.size().x.max(sub.size().x), full.size().y + sub.size().y));
-            insts[l.inst].t = [bx.min.x, bx.min.y, bx.max.x, bx.max.y];
-            insts[l.inst].q[3] = f_in * fade;
+            if boxes.len() == gfx::NO_LABEL as usize {
+                continue; // shortcut: no dark patch left for it, so no text; only ever this many fit on screen
+            }
+            insts[l.inst].p[1] = boxes.len() as u8;
+            insts[l.inst].q[2] = gfx::unorm(f_in * fade);
+            boxes.push([bx.min.x, bx.min.y, bx.max.x, bx.max.y]);
             let (name, sub) = if f_in < 1.0 { (wrapped(typed(&l.text)), p.layout_no_wrap(typed(&l.sub), font.clone(), white)) } else { (full.clone(), sub) };
             let top = l.pos.y - (full.size().y + sub.size().y) * 0.5;
             for (g, y) in [(name, top), (sub, top + full.size().y)] {
                 p.galley(pos2(l.pos.x, y) - g.rect.center_top().to_vec2(), g, white);
             }
         }
-        painter.set(field, gfx::shape(area, insts, 1, &waves.iter().map(Wave::gpu).collect::<Vec<_>>()));
+        drop(labels_t);
+        painter.set(field, gfx::shape(area, insts, boxes, 1, &waves.iter().map(Wave::gpu).collect::<Vec<_>>()));
 
         // Interaction.
         // Own tooltip instead of egui's: shown at once and kept up while the tiles change under a
@@ -1110,7 +1140,7 @@ impl App {
     /// Draw the layer stack: layer j (`steps[j].old`, the top one the current tiles) under camera
     /// `cams[j]`. A tile an expand/collapse left unchanged belongs to both layers around it: drawn
     /// once, untouched by that wave.
-    fn layers(&self, t: &Tree, steps: &[Step], cams: &[Map], insts: &mut Vec<Inst>, labels: &mut Vec<Label>) {
+    fn layers(&self, t: &Tree, steps: &[Step], cams: &[Map], area: Rect, insts: &mut Vec<Inst>, labels: &mut Vec<Label>) {
         let n = steps.len();
         let layer = |j: usize| if j < n { &steps[j].old[..] } else { &self.tiles[..] };
         let local = |j: usize| j < n && steps[j].local;
@@ -1129,7 +1159,7 @@ impl App {
                 }
                 // A step's shared title is drawn once, by the layer it leads to, untouched by its wave.
                 let label = if hi < n && steps[hi].anchor == Some(x.item) { None } else { Some(j > 0 && steps[j - 1].anchor == Some(x.item)) };
-                self.draw(t, x, cams[j], (j, hi), hi == n, label, insts, labels);
+                self.draw(t, x, cams[j], area, (j, hi), hi == n, label, insts, labels);
             }
         }
     }
@@ -1137,24 +1167,22 @@ impl App {
     /// One tile, camera-mapped, belonging to layers `lo..=hi`; `top`: of the current layout (the
     /// only one hover applies to: lit rects are in its coords); `label`: none, or whether it is
     /// fixed (see [`Label`]). Label visibility is decided in layout space so the camera never makes
-    /// labels pop. Tolerates stale items.
+    /// labels pop. Tolerates stale items. Only what covers a dot cell's centre inside `area` is
+    /// drawn (the field is one texel per cell, see gfx.rs): the thousands of specks of a layer
+    /// zoomed away, or pushed off screen, cost nothing.
     #[allow(clippy::too_many_arguments)]
-    fn draw(&self, t: &Tree, tile: &Tile, cam: Map, (lo, hi): (usize, usize), top: bool, label: Option<bool>, insts: &mut Vec<Inst>, labels: &mut Vec<Label>) {
+    fn draw(&self, t: &Tree, tile: &Tile, cam: Map, area: Rect, (lo, hi): (usize, usize), top: bool, label: Option<bool>, insts: &mut Vec<Inst>, labels: &mut Vec<Label>) {
         let r = apply_rect(cam, tile.rect);
-        if r.width() <= 0.0 || r.height() <= 0.0 {
+        let v = r.intersect(area);
+        let p = self.pitch;
+        // Cell centres (k + 0.5) * p within [a, b), as the rasterizer samples them.
+        let any = |a: f32, b: f32| (b / p - 0.5).ceil() > (a / p - 0.5).ceil();
+        if !any(v.min.x, v.max.x) || !any(v.min.y, v.max.y) {
             return;
         }
         let item = tile.item;
-        let (is_dir, col, size, name) = match item {
-            Item::Dir(d) => {
-                let Some(x) = t.dirs.get(d as usize) else { return };
-                (true, FOLDER_RGB, x.size, &*x.name)
-            }
-            Item::File(d, f) => {
-                let Some(x) = t.dirs.get(d as usize).and_then(|x| x.files.get(f as usize)) else { return };
-                (false, rgb(x.cat), x.size, &*x.name)
-            }
-        };
+        let is_dir = matches!(item, Item::Dir(_));
+        let col = if is_dir { FOLDER_RGB } else { CATS[tile.cat as usize].1 };
         let mut hov = 0.0;
         if top {
             hov = self.hover_fx.iter().find(|x| x.0 == item).map_or(0.0, |x| x.1 * x.1 * (3.0 - 2.0 * x.1));
@@ -1165,17 +1193,22 @@ impl App {
                 }
             }
         }
+        let flags = gfx::FIELD | if tile.solid { gfx::SOLID } else { 0 } | if tile.open { gfx::OPEN } else { 0 };
         insts.push(Inst {
             rect: [r.min.x, r.min.y, r.max.x, r.max.y],
-            color: [col[0], col[1], col[2], 1.0],
-            p: [gfx::FIELD, tile.solid as u8 as f32, lo as f32, hi as f32],
-            q: [if tile.open { self.header } else { 0.0 }, hov, tile.tone as f32 / (layout::TONES - 1) as f32, 0.0],
-            t: gfx::NO_TEXT,
+            color: gfx::rgba(col, 1.0),
+            p: [flags, gfx::NO_LABEL, lo as u8, hi as u8],
+            q: [if hov > 0.0 { gfx::unorm(hov) } else { 0 }, (tile.tone as u16 * 255 / (layout::TONES - 1) as u16) as u8, 0, 0],
         });
         let inst = insts.len() - 1;
         let Some(fixed) = label else { return };
         let lr = tile.rect;
+        let info = || match item {
+            Item::Dir(d) => t.dirs.get(d as usize).map(|x| (x.size, &*x.name)),
+            Item::File(d, f) => t.dirs.get(d as usize).and_then(|x| x.files.get(f as usize)).map(|x| (x.size, &*x.name)),
+        };
         if tile.open {
+            let Some((size, name)) = info() else { return };
             labels.push(Label {
                 lo,
                 hi,
@@ -1189,6 +1222,7 @@ impl App {
                 inst,
             });
         } else if (!is_dir || tile.titled) && lr.width() > 24.0 && lr.height() > 24.0 {
+            let Some((size, name)) = info() else { return };
             // Files and closed folders: name (up to 2 lines) and size inside.
             labels.push(Label {
                 lo,
@@ -1304,9 +1338,12 @@ impl eframe::App for App {
             }
         }
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        // The whole previous frame on the CPU as eframe saw it (incl. tessellation and painting).
+        perf::add("prev-cpu", frame.info().cpu_usage.unwrap_or(0.0) as f64 * 1e3);
         // Fifo already blocks in present; DwmFlush there would only add a second wait.
         if self.mailbox && !minimized {
             // Mailbox never blocks; DwmFlush paces us to the compositor without a GPU busy-wait.
+            let _s = perf::span("dwm-wait");
             win::dwm_flush();
         }
         let frame_t0 = Instant::now();
@@ -1315,12 +1352,18 @@ impl eframe::App for App {
             self.frames.pop_front();
         }
 
-        self.pump();
+        {
+            let _s = perf::span("pump");
+            self.pump();
+        }
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
 
         egui::Panel::top("toolbar")
             .frame(egui::Frame::NONE.fill(BG).inner_margin(Margin::symmetric(10, 6)))
-            .show(ui, |ui| self.toolbar(ui));
+            .show(ui, |ui| {
+                let _s = perf::span("toolbar");
+                self.toolbar(ui)
+            });
 
         egui::Panel::bottom("status")
             .frame(egui::Frame::NONE.fill(BG).inner_margin(Margin::symmetric(12, 4)))
@@ -1344,7 +1387,10 @@ impl eframe::App for App {
                     self.chooser(ui);
                     return;
                 }
-                self.treemap(ui);
+                {
+                    let _s = perf::span("treemap");
+                    self.treemap(ui);
+                }
                 let parts = self.step_particles(dt);
                 gfx::paint(ui.painter(), ui.clip_rect(), parts, 2, &[]);
             });
@@ -1366,6 +1412,7 @@ impl eframe::App for App {
         }
 
         self.cpu_ms = self.cpu_ms * 0.9 + frame_t0.elapsed().as_secs_f32() * 1000.0 * 0.1;
+        perf::frame(frame_t0.elapsed().as_secs_f64() * 1e3);
         // The pixel field is static: keep drawing only while something moves (input repaints anyway).
         let easing = self.hover_fx.iter().chain(&self.group_fx).any(|x| x.1 < 1.0);
         let busy = self.scan.is_some() || self.anim.is_some() || !self.particles.is_empty() || easing;

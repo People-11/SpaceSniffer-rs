@@ -16,6 +16,10 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[features]
+# Console build that prints frame timings (see src/perf.rs): cargo build --release --features perf
+perf = []
+
 [profile.release]
 # Size-optimised: the hot paths are I/O-bound (scan) or on the GPU; measured no fps/scan-time loss.
 opt-level = "s"
