@@ -31,6 +31,8 @@ pub struct Tile {
     pub titled: bool,
     /// Brightness tone 0..TONES: differs from every edge-adjacent visible tile (see `tones`).
     pub tone: u8,
+    /// In its folder's block of small tiles: no gutter of its own (the block has one).
+    pub solid: bool,
 }
 
 /// Does a folder named `name` at `r` get a title strip (and children)? Only if its name fits;
@@ -147,12 +149,11 @@ struct Grid {
     header: f32,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn dir(tree: &Tree, d: u32, r: Rect, depth: u16, expanded: &HashSet<u32>, g: &Grid, out: &mut Vec<Tile>) {
     let idx = out.len();
     let x = &tree.dirs[d as usize];
     let has_title = depth == 0 || titled(&x.name, r, g.header); // the view root always opens
-    out.push(Tile { rect: r, item: Item::Dir(d), open: false, titled: has_title, tone: 0 });
+    out.push(Tile { rect: r, item: Item::Dir(d), open: false, titled: has_title, tone: 0, solid: false });
     // Children fill everything below the title strip: no padding gutters.
     let inner = Rect::from_min_max(pos2(r.min.x, r.min.y + g.header), r.max);
     // Opens by default only if its name fits; a folder the user clicked opens regardless.
@@ -179,21 +180,60 @@ fn dir(tree: &Tree, d: u32, r: Rect, depth: u16, expanded: &HashSet<u32>, g: &Gr
     for k in &mut kids {
         k.0 *= area / kept;
     }
+    // Tiles too small for a gutter (see shader.wgsl) can't be outlined one by one: from the first
+    // of them on (the smallest come last), they are gathered into one block that gets the gutter
+    // (top row and left column, the folder's dark body showing through) and fill it unoutlined.
+    // The block goes last, so it takes the bottom-right corner; whatever comes out too small
+    // beside it joins it too, until every tile outside it has room for its own gutter.
+    let small = |r: Rect| {
+        let r = snap(r, g.pitch);
+        (r.width().min(r.height()) / g.pitch).round() < MIN_GUTTER
+    };
     let mut placed = Vec::new();
-    squarify(&kids, inner, &mut placed);
-    for (rect, item) in placed {
+    let mut k = kids.len();
+    loop {
+        placed.clear();
+        let mut top = kids[..k].to_vec();
+        if k < kids.len() {
+            top.push((kids[k..].iter().map(|t| t.0).sum(), REST));
+        }
+        squarify(&top, inner, &mut placed);
+        // squarify keeps the order, so the first small tile's index is its index in `kids`.
+        match placed.iter().position(|p| p.1 != REST && small(p.0)) {
+            Some(j) => k = j,
+            None => break,
+        }
+    }
+    let mut solid = placed.len();
+    if let Some(i) = placed.iter().position(|p| p.1 == REST) {
+        let block = snap(placed.swap_remove(i).0, g.pitch);
+        solid = placed.len();
+        let body = if small(block) { block } else { Rect::from_min_max(block.min + vec2(g.pitch, g.pitch), block.max) };
+        let scale = (body.width() * body.height()) as f64 / kids[k..].iter().map(|t| t.0).sum::<f64>();
+        let tail: Vec<(f64, Item)> = kids[k..].iter().map(|&(s, it)| (s * scale, it)).collect();
+        squarify(&tail, body, &mut placed);
+    }
+    for (n, (rect, item)) in placed.into_iter().enumerate() {
         let rect = snap(rect, g.pitch);
         if rect.width() <= 0.0 || rect.height() <= 0.0 {
             continue; // rounded away on the lattice: its neighbours' snapped edges absorb it
         }
+        let at = out.len();
         match item {
             Item::Dir(c) => dir(tree, c, rect, depth + 1, expanded, g, out),
-            Item::File(..) => out.push(Tile { rect, item, open: false, titled: false, tone: 0 }),
+            Item::File(..) => out.push(Tile { rect, item, open: false, titled: false, tone: 0, solid: false }),
         }
+        out[at].solid = n >= solid;
     }
 }
 
-/// `items` sorted descending, areas already scaled so their sum == rect area.
+/// Smallest tile side (dots) that gets a gutter; must match the gutter rule in shader.wgsl.
+const MIN_GUTTER: f32 = 3.0;
+/// Placeholder for the block of small tiles while laying out (no dir has this index).
+const REST: Item = Item::Dir(u32::MAX);
+
+/// `items` sorted descending (except a last one, which then takes the bottom-right corner, less
+/// square), areas already scaled so their sum == rect area. Keeps their order in `out`.
 fn squarify(items: &[(f64, Item)], mut r: Rect, out: &mut Vec<(Rect, Item)>) {
     let mut i = 0;
     while i < items.len() {
@@ -341,5 +381,30 @@ mod tests {
         let inner = Rect::from_min_max(pos2(root.min.x, root.min.y + header(3.0)), root.max);
         let covered: f32 = out[1..].iter().map(|x| x.rect.area()).sum();
         assert!((covered - inner.area()).abs() < 1e-2, "{covered} vs {}", inner.area());
+    }
+
+    /// Files too small for their own gutter sit together in one block, and that block has a whole
+    /// top row and left column of gutter (nothing covers it: the folder's dark body shows).
+    #[test]
+    fn small_files_share_one_outlined_block() {
+        let mut t = Tree::new("R");
+        let mut files: Vec<(Box<str>, u64)> = (0..12).map(|i| (format!("big{i}").into(), 100_000 - i * 5000)).collect();
+        files.extend((0..300).map(|i| (format!("f{i}").into(), 200 + i)));
+        t.apply(crate::tree::Batch { id: 0, files, dirs: vec![] });
+        let p = 3.0;
+        let mut out = vec![];
+        build(&t, 0, Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 400.0)), &HashSet::new(), p, &[], &mut out);
+        let small: Vec<Rect> = out[1..].iter().filter(|x| x.solid).map(|x| x.rect).collect();
+        // Everything outside the block has room for its own gutter.
+        assert!(out[1..].iter().all(|x| x.solid || x.rect.width().min(x.rect.height()) >= MIN_GUTTER * p - 0.01));
+        assert!(small.len() > 50, "the test needs many small files");
+        let b = small.iter().fold(Rect::NOTHING, |a, r| a.union(*r));
+        let gutter = [Rect::from_min_max(b.min - vec2(p, p), pos2(b.max.x, b.min.y)), Rect::from_min_max(b.min - vec2(p, p), pos2(b.min.x, b.max.y))];
+        for x in &out[1..] {
+            let r = x.rect.shrink(0.01);
+            assert!(!small.contains(&x.rect) || b.contains_rect(x.rect));
+            assert!(small.contains(&x.rect) || !r.intersects(b), "a big tile inside the block: {:?}", x.rect);
+            assert!(gutter.iter().all(|g| !r.intersects(*g)), "{:?} covers the block's gutter", x.rect);
+        }
     }
 }

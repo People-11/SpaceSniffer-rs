@@ -11,7 +11,8 @@ use wgpu::util::DeviceExt;
 pub struct Inst {
     pub rect: [f32; 4],
     pub color: [f32; 4],
-    /// kind (FIELD / PARTICLE), glow radius (pt), first and last transition layer it belongs to.
+    /// kind (FIELD / PARTICLE), particles: glow radius (pt) / fields: 1 = no gutter of its own,
+    /// first and last transition layer it belongs to.
     pub p: [f32; 4],
     /// Title strip height (pt), hover 0..1, tone 0..1, label visibility 0..1 (scales the label box's dimming).
     pub q: [f32; 4],

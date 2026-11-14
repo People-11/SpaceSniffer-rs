@@ -22,7 +22,7 @@ struct U {
 struct Inst {
     @location(0) rect: vec4f,  // min.xy, max.xy (points, screen space)
     @location(1) color: vec4f, // rgb, intensity
-    @location(2) p: vec4f,     // kind, glow radius(pt), first and last transition layer it belongs to
+    @location(2) p: vec4f,     // kind, glow radius(pt) | field: 1 = no gutter, first and last transition layer
     @location(3) q: vec4f,     // header h(pt), hover, tone (0..1), label visibility (0..1)
     @location(4) t: vec4f,     // label box (min.xy, max.xy); empty = none
 };
@@ -43,7 +43,7 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> V {
         vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(0.0, 1.0),
         vec2f(0.0, 1.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0),
     );
-    let g = i.p.y;
+    let g = select(0.0, i.p.y, u32(i.p.x) == 2u);
     let pt = mix(i.rect.xy - g, i.rect.zw + g, corners[vi]);
     let ndc = (pt - u.origin) / u.size * 2.0 - 1.0;
     var o: V;
@@ -88,7 +88,7 @@ fn wave_e(i: u32, p: vec2f, cs: f32) -> f32 {
 @fragment
 fn fs(v: V) -> @location(0) vec4f {
     let kind = u32(v.p.x);
-    let glow = v.p.y;
+    let glow = select(0.0, v.p.y, kind == 2u);
     let col = v.color.rgb;
     let inten = v.color.a;
     let hover = v.q.y;
@@ -139,13 +139,13 @@ fn fs(v: V) -> @location(0) vec4f {
         return vec4f(col * inten, 0.0);
     }
 
-    // Quiet zone: dots under a label and up to 2 dots around it are dimmed, so the text always
-    // sits on a dark patch; it fades with the label during transitions.
+    // Quiet zone: the dots under a label and one dot around it turn into title strip dots (below),
+    // so the text always sits on a dark patch; it fades with the label during transitions.
     var quiet = 0.0;
     if (v.t.z > v.t.x) {
         let cc = (cell + 0.5) * cs / u.ppp;
         let out = max(v.t.xy - cc, cc - v.t.zw);
-        quiet = clamp(1.0 - max(out.x, out.y) / (2.0 * cs / u.ppp), 0.0, 1.0) * v.q.w;
+        quiet = select(0.0, v.q.w, max(out.x, out.y) < cs / u.ppp);
     }
 
     // Ordered dither: every dot takes one of 5 levels. A tile's value picks the mix of two adjacent
@@ -167,14 +167,21 @@ fn fs(v: V) -> @location(0) vec4f {
     // The wave's light lifts the tile's own levels (no white overlay): the pattern itself glows
     // and settles back as it cools.
     n = min(n + 2.0 * born, 3.9);
-    n *= 1.0 - 0.8 * quiet;
-    // Directory header strip: sparse and dark under its title.
-    if (v.pt.y < v.rect.y + v.q.x) { n = 0.4 + 0.6 * hover + 2.0 * born; }
+    // Directory header strip: sparse and dark under its title. A label's quiet zone takes the
+    // same level as an unlit strip (a fading label's mixes the two, still pure dither).
+    let strip = 0.4 + 2.0 * born;
+    n = mix(n, strip, quiet);
+    if (v.pt.y < v.rect.y + v.q.x) { n = strip + 0.6 * hover; }
     let fl = min(floor(n), 3.0);
     var level = fl + step(bayer4(cell), clamp(n - fl, 0.1, 0.9));
     // Gutter: the top row and left column of every tile big enough to spare them, so each shared
     // edge is one dark line; smaller tiles are told apart by their pattern alone.
-    if (min(ts.x, ts.y) >= 3.0 && min(rd.x, rd.y) < 0.5) { level = 0.0; }
+    // An open folder's body is gutter too: its children cover it, except the gutter around its
+    // block of small tiles (see layout.rs).
+    let body = v.q.x > 0.0 && v.pt.y >= v.rect.y + v.q.x;
+    // Tiles in a folder's block of small ones (p.y = 1) have none: the block has it.
+    let own = kind == 0u && v.p.y < 0.5 && min(ts.x, ts.y) >= 3.0;
+    if ((own && min(rd.x, rd.y) < 0.5) || body) { level = 0.0; }
     var rgb = col * (0.07 + 0.93 * pow(level / 4.0, 1.6));
     rgb *= (1.0 + 0.5 * born * born) * inten; // highlight at the wave front: brighter, same colour
     return vec4f(rgb, 1.0);

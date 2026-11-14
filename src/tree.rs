@@ -1,8 +1,7 @@
 //! Directory tree + incremental parallel scanner.
 //!
 //! Worker threads walk the disk and stream one `Batch` per directory to the UI thread,
-//! which merges it into the arena. Every file/dir remembers when it was discovered so the
-//! renderer can flash new tiles white-hot and let them cool down to their category color.
+//! which merges it into the arena.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -334,6 +333,8 @@ mod tests {
         t.apply(Batch { id: 2, files: vec![("e".into(), 1000)], dirs: vec![] });
         let root = |t: &Tree| (t.dirs[0].size, t.dirs[0].nfiles);
         assert_eq!(root(&t), (1330, 5));
+        // The path the Recycle Bin gets: root first, every level in order.
+        assert_eq!(t.path(Item::File(1, 1)), PathBuf::from("R/s/d"));
         t.remove(Item::File(1, 0));
         assert_eq!((root(&t), t.dirs[1].size, &*t.dirs[1].files[0].name), ((1230, 4), 200, "d"));
         t.remove(Item::Dir(2));

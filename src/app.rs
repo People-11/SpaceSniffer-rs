@@ -14,7 +14,6 @@ use std::time::Instant;
 const BG: Color32 = Color32::from_rgb(11, 12, 15);
 const CARD: Color32 = Color32::from_rgb(21, 22, 26);
 const TEXT_DIM: Color32 = Color32::from_rgb(140, 144, 152);
-const DIM: f32 = 0.22;
 const MAX_PARTICLES: usize = 8000;
 /// Transition lengths: in-place expand/collapse must feel instant, zooms carry more motion.
 const LOCAL_SECS: f32 = 0.6;
@@ -185,6 +184,16 @@ struct Step {
     origin: Pos2,
     rect: Rect,
     outside: bool,
+    /// `old` by item, when an expand/collapse on either side of it needs to find its unchanged
+    /// tiles (`old` never changes, so this is built once).
+    at: Option<At>,
+}
+
+/// Tiles by item: (rect, open).
+type At = HashMap<Item, (Rect, bool)>;
+
+fn index(tiles: &[Tile]) -> At {
+    tiles.iter().map(|x| (x.item, (x.rect, x.open))).collect()
 }
 
 impl Step {
@@ -313,83 +322,6 @@ fn typed(text: &str, f: f32) -> String {
     text.chars().take((n as f32 * f).ceil() as usize).collect()
 }
 
-// ------------------------------------------------------------------ filter
-
-/// SpaceSniffer-like filter: `*.mp4; >100mb; <2gb; name`. Name terms are OR-ed, size terms AND-ed.
-#[derive(Default)]
-pub struct Filter {
-    min: Option<u64>,
-    max: Option<u64>,
-    pats: Vec<String>,
-}
-
-impl Filter {
-    pub fn parse(s: &str) -> Self {
-        let mut f = Filter::default();
-        for t in s.split([';', ' ', ',']).map(str::trim).filter(|t| !t.is_empty()) {
-            if let Some(v) = t.strip_prefix('>').and_then(parse_size) {
-                f.min = Some(v);
-            } else if let Some(v) = t.strip_prefix('<').and_then(parse_size) {
-                f.max = Some(v);
-            } else {
-                f.pats.push(t.to_lowercase());
-            }
-        }
-        f
-    }
-
-    pub fn active(&self) -> bool {
-        self.min.is_some() || self.max.is_some() || !self.pats.is_empty()
-    }
-
-    pub fn matches(&self, name: &str, size: u64) -> bool {
-        if self.min.is_some_and(|m| size < m) || self.max.is_some_and(|m| size > m) {
-            return false;
-        }
-        if self.pats.is_empty() {
-            return true;
-        }
-        let n = name.to_lowercase();
-        self.pats.iter().any(|p| if p.contains(['*', '?']) { glob(p.as_bytes(), n.as_bytes()) } else { n.contains(p.as_str()) })
-    }
-}
-
-fn parse_size(s: &str) -> Option<u64> {
-    let s = s.trim().to_lowercase();
-    let i = s.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(s.len());
-    let n: f64 = s[..i].parse().ok()?;
-    let mul = match s[i..].trim() {
-        "" | "b" => 1u64,
-        "k" | "kb" => 1 << 10,
-        "m" | "mb" => 1 << 20,
-        "g" | "gb" => 1 << 30,
-        "t" | "tb" => 1 << 40,
-        _ => return None,
-    };
-    Some((n * mul as f64) as u64)
-}
-
-fn glob(p: &[u8], s: &[u8]) -> bool {
-    let (mut pi, mut si, mut star, mut mark) = (0, 0, None, 0);
-    while si < s.len() {
-        if pi < p.len() && (p[pi] == b'?' || p[pi] == s[si]) {
-            pi += 1;
-            si += 1;
-        } else if pi < p.len() && p[pi] == b'*' {
-            star = Some(pi);
-            mark = si;
-            pi += 1;
-        } else if let Some(st) = star {
-            pi = st + 1;
-            mark += 1;
-            si = mark;
-        } else {
-            return false;
-        }
-    }
-    p[pi..].iter().all(|&c| c == b'*')
-}
-
 struct Particle {
     pos: Pos2,
     vel: Vec2,
@@ -413,7 +345,6 @@ struct Label {
     /// File labels: room for the text in layout space (fit is decided there, so zooms don't pop).
     room: Vec2,
     size: f32,
-    alpha: f32,
     /// Index of the tile's instance (gets the label box as its quiet zone).
     inst: usize,
 }
@@ -422,7 +353,6 @@ pub struct App {
     tree: Option<Tree>,
     scan: Option<tree::Scan>,
     scan_t0: Instant,
-    root: PathBuf,
     disk: Option<(u64, u64)>,
     view: u32,
     back: Vec<u32>,
@@ -448,8 +378,6 @@ pub struct App {
     /// Dot lattice pitch and folder title height (points) for the current DPI.
     pitch: f32,
     header: f32,
-    /// Per-tile hover brightness 0..1 (current hover rising, previous ones fading).
-    /// [lift, tone equalisation], each easing 0..1.
     /// Directly lit tiles (hovered + its parent; a handful): lifted and eased to the top tone, 0..1.
     hover_fx: Vec<(Item, f32)>,
     /// Folders whose whole block is lit (hovered title): lift 0..1. Kept per folder, not per tile,
@@ -459,8 +387,6 @@ pub struct App {
     /// Camera of the target layout last frame (layout rect -> screen rect), for hit-testing mid-zoom.
     cam: Map,
     confirm: Option<Item>,
-    filter_text: String,
-    filter: Filter,
     particles: Vec<Particle>,
     rng: u64,
     t0: Instant,
@@ -484,7 +410,6 @@ impl App {
             tree: None,
             scan: None,
             scan_t0: now,
-            root: PathBuf::new(),
             disk: None,
             view: 0,
             back: vec![],
@@ -509,8 +434,6 @@ impl App {
             group_lit: vec![],
             cam: (Rect::from_min_size(Pos2::ZERO, Vec2::splat(1.0)), Rect::from_min_size(Pos2::ZERO, Vec2::splat(1.0))),
             confirm: None,
-            filter_text: String::new(),
-            filter: Filter::default(),
             particles: vec![],
             rng: 0x2545f4914f6cdd1d,
             t0: now,
@@ -557,7 +480,6 @@ impl App {
         let pb = std::path::absolute(&pb).unwrap_or(pb);
         self.disk = win::disk_space(&pb);
         self.tree = Some(Tree::new(&pb.to_string_lossy()));
-        self.root = pb.clone();
         self.reset_nav();
         self.begin_scan(pb, 0, 1);
     }
@@ -594,7 +516,7 @@ impl App {
         let path = t.path(Item::Dir(self.view));
         t.clear_dir(self.view);
         let next = t.dirs.len() as u32;
-        self.disk = win::disk_space(&self.root);
+        self.disk = win::disk_space(&t.path(Item::Dir(0)));
         self.anim = None;
         // The old tiles index files that are gone, and the history can lead into orphaned dirs.
         self.tiles.clear();
@@ -623,7 +545,7 @@ impl App {
         if done {
             self.scan = None;
             let secs = self.scan_t0.elapsed().as_secs_f32();
-            self.disk = win::disk_space(&self.root);
+            self.disk = win::disk_space(&t.path(Item::Dir(0)));
             self.status = format!("Ready · scanned in {secs:.2}s");
         }
     }
@@ -762,47 +684,33 @@ impl App {
         let mut nav = None;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            if tool(ui, "📂", "Choose your space", true, false) {
+            if tool(ui, "\u{E838}", "Choose your space", true, false) {
                 self.tree = None;
                 self.scan = None;
                 self.status = "Ready".into();
                 self.drives = win::drives();
             }
             ui.separator();
-            if tool(ui, "⬅", "Back (Mouse 4)", !self.back.is_empty(), mouse4) {
+            if tool(ui, "\u{E72B}", "Back (Mouse 4)", !self.back.is_empty(), mouse4) {
                 self.go_back();
             }
-            if tool(ui, "➡", "Forward (Mouse 5)", !self.fwd.is_empty(), mouse5) {
+            if tool(ui, "\u{E72A}", "Forward (Mouse 5)", !self.fwd.is_empty(), mouse5) {
                 self.go_fwd();
             }
-            if tool(ui, "⬆", "Up one level (Backspace)", has_tree && self.view != 0, bksp) {
+            if tool(ui, "\u{E74A}", "Up one level (Backspace)", has_tree && self.view != 0, bksp) {
                 self.go_up();
             }
-            if tool(ui, "🏠", "Root", has_tree && self.view != 0, false) {
+            if tool(ui, "\u{E80F}", "Root", has_tree && self.view != 0, false) {
                 nav = Some(0);
             }
             ui.separator();
             // Not while scanning: rescanning one folder cancels the scan of everything else.
-            if tool(ui, "🔄", "Rescan current view (F5)", has_tree && self.scan.is_none(), f5) {
+            if tool(ui, "\u{E72C}", "Rescan current view (F5)", has_tree && self.scan.is_none(), f5) {
                 self.rescan();
             }
-            if tool(ui, "⏹", "Stop scanning", self.scan.is_some(), false) {
+            if tool(ui, "\u{E71A}", "Stop scanning", self.scan.is_some(), false) {
                 self.scan = None;
                 self.status = "Stopped".into();
-            }
-            ui.separator();
-            ui.label(RichText::new("Filter").color(TEXT_DIM));
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut self.filter_text)
-                    .hint_text("*.mp4; >100mb; <2gb; name")
-                    .desired_width(240.0),
-            );
-            if r.changed() {
-                self.filter = Filter::parse(&self.filter_text);
-            }
-            if self.filter.active() && tool(ui, "✖", "Clear filter", true, false) {
-                self.filter_text.clear();
-                self.filter = Filter::default();
             }
             // Breadcrumb, right aligned, deepest last.
             if let Some(t) = &self.tree {
@@ -837,7 +745,6 @@ impl App {
             egui::Frame::NONE.fill(CARD).corner_radius(14).inner_margin(22).show(ui, |ui| {
                 ui.set_width(520.0);
                 ui.label(RichText::new("Choose your space").size(24.0).strong().color(Color32::WHITE));
-                ui.label(RichText::new("Pick a drive or type a folder path").color(TEXT_DIM));
                 ui.add_space(14.0);
                 // Drives as pixel-field blocks like the treemap's folders: title strip, used space lit,
                 // free space dim; a gap between drives instead of borders.
@@ -864,20 +771,19 @@ impl App {
                         insts.push(block(Rect::from_min_max(r.min, pos2(r.max.x, body.min.y)), 1.0, header));
                         insts.push(block(body, 0.3, 0.0));
                         let name = d.trim_end_matches('\\');
-                        let (title, sub) = match space {
+                        let title = match space {
                             Some((tot, free)) => {
                                 let used = 1.0 - *free as f32 / (*tot).max(1) as f32;
                                 let fill = layout::snap(Rect::from_min_max(body.min, pos2(body.min.x + body.width() * used, body.max.y)), pitch);
                                 if fill.width() > 0.0 {
                                     insts.push(block(fill, 1.0, 0.0));
                                 }
-                                (format!("{name} - {} free", fmt_size(*free)), format!("{:.0}% of {}", used * 100.0, fmt_size(*tot)))
+                                format!("{name} - {} free", fmt_size(*free))
                             }
-                            None => (name.to_string(), String::new()),
+                            None => name.to_string(),
                         };
                         let (p, y, font) = (ui.painter(), r.min.y + header * 0.5, FontId::proportional(12.0));
-                        p.text(pos2(r.min.x + 4.0, y), Align2::LEFT_CENTER, title, font.clone(), Color32::WHITE);
-                        p.text(pos2(r.max.x - 4.0, y), Align2::RIGHT_CENTER, sub, font, TEXT_DIM);
+                        p.text(pos2(r.min.x + 4.0, y), Align2::LEFT_CENTER, title, font, Color32::WHITE);
                         if resp.clicked() {
                             go = Some(d.clone());
                         }
@@ -885,10 +791,20 @@ impl App {
                 });
                 ui.painter().set(field, gfx::shape(ui.clip_rect(), insts, 0, &[]));
                 ui.add_space(14.0);
-                ui.horizontal(|ui| {
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.path_input).hint_text("C:\\Users").desired_width(400.0));
+                // Path field + Start span exactly the row of drives above.
+                let row = vec2(cols * size.x + (cols - 1.0) * gap, 28.0);
+                ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    let start = ui.add(egui::Button::new("  Start  ").min_size(vec2(0.0, row.y))).clicked();
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.path_input)
+                            .hint_text("C:\\Users")
+                            .desired_width(ui.available_width())
+                            .align(Align2::LEFT_CENTER)
+                            .min_size(vec2(0.0, row.y)),
+                    );
                     let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                    if ui.button("  Start  ").clicked() || enter {
+                    if start || enter {
                         go = Some(self.path_input.clone());
                     }
                 });
@@ -999,7 +915,9 @@ impl App {
                     };
                     let a = self.anim.get_or_insert_with(|| Anim { steps: vec![], v0: area });
                     a.v0 = view_after(cam, rel, area);
-                    a.steps.push(Step { old, rel, local: from == to, anchor, t0: now, origin, rect, outside });
+                    let local = from == to;
+                    let at = (local || a.steps.last().is_some_and(|s| s.local)).then(|| index(&old));
+                    a.steps.push(Step { old, rel, local, anchor, t0: now, origin, rect, outside, at });
                     if a.steps.len() > gfx::MAX_WAVES {
                         a.steps.remove(0); // shortcut: the oldest layer flips at once; needs 5 clicks inside one transition
                     }
@@ -1061,7 +979,7 @@ impl App {
             // per tile. No shadow: labels sit on a dark title strip or a dimmed quiet zone.
             let p = if !waves.is_empty() { painter.with_clip_rect(l.clip.intersect(painter.clip_rect())) } else { painter.clone() };
             let font = FontId::proportional(l.size);
-            let white = Color32::from_white_alpha((l.alpha * fade * 255.0) as u8);
+            let white = Color32::from_white_alpha((0.92 * fade * 255.0) as u8);
             if l.sub.is_empty() {
                 // Title strip: "name - size", elided at the end when too wide.
                 let mut job = egui::text::LayoutJob::simple_singleline(typed(&l.text), font, white);
@@ -1173,9 +1091,10 @@ impl App {
         let n = steps.len();
         let layer = |j: usize| if j < n { &steps[j].old[..] } else { &self.tiles[..] };
         let local = |j: usize| j < n && steps[j].local;
-        let at: Vec<Option<HashMap<Item, (Rect, bool)>>> =
-            (0..=n).map(|j| (local(j) || (j > 0 && local(j - 1))).then(|| layer(j).iter().map(|x| (x.item, (x.rect, x.open))).collect())).collect();
-        let same = |j: usize, x: &Tile| at[j].as_ref().is_some_and(|m| m.get(&x.item) == Some(&(x.rect, x.open)));
+        // Only the top layer can change (the scan goes on): index it per frame, and only if needed.
+        let top = (n > 0 && local(n - 1)).then(|| index(&self.tiles));
+        let at = |j: usize| if j < n { steps[j].at.as_ref() } else { top.as_ref() };
+        let same = |j: usize, x: &Tile| at(j).is_some_and(|m| m.get(&x.item) == Some(&(x.rect, x.open)));
         for j in 0..=n {
             for x in layer(j) {
                 if j > 0 && local(j - 1) && same(j - 1, x) {
@@ -1187,16 +1106,17 @@ impl App {
                 }
                 // A step's shared title is drawn once, by the layer it leads to, untouched by its wave.
                 let label = if hi < n && steps[hi].anchor == Some(x.item) { None } else { Some(j > 0 && steps[j - 1].anchor == Some(x.item)) };
-                self.draw(t, x, cams[j], (j, hi), label, insts, labels);
+                self.draw(t, x, cams[j], (j, hi), hi == n, label, insts, labels);
             }
         }
     }
 
-    /// One tile, camera-mapped, belonging to layers `lo..=hi`; `label`: none, or whether it is
+    /// One tile, camera-mapped, belonging to layers `lo..=hi`; `top`: of the current layout (the
+    /// only one hover applies to: lit rects are in its coords); `label`: none, or whether it is
     /// fixed (see [`Label`]). Label visibility is decided in layout space so the camera never makes
     /// labels pop. Tolerates stale items.
     #[allow(clippy::too_many_arguments)]
-    fn draw(&self, t: &Tree, tile: &Tile, cam: Map, (lo, hi): (usize, usize), label: Option<bool>, insts: &mut Vec<Inst>, labels: &mut Vec<Label>) {
+    fn draw(&self, t: &Tree, tile: &Tile, cam: Map, (lo, hi): (usize, usize), top: bool, label: Option<bool>, insts: &mut Vec<Inst>, labels: &mut Vec<Label>) {
         let r = apply_rect(cam, tile.rect);
         if r.width() <= 0.0 || r.height() <= 0.0 {
             return;
@@ -1212,24 +1132,25 @@ impl App {
                 (false, rgb(x.cat), x.size, &*x.name)
             }
         };
-        let dim = self.filter.active() && !is_dir && !self.filter.matches(name, size);
-        let mut hov = self.hover_fx.iter().find(|x| x.0 == item).map_or(0.0, |x| x.1 * x.1 * (3.0 - 2.0 * x.1));
-        // Inside a lit folder (its rect strictly contains ours): lit the same way.
-        for &(g, v) in &self.group_lit {
-            if g != tile.rect && g.contains_rect(tile.rect) {
-                hov = hov.max(v);
+        let mut hov = 0.0;
+        if top {
+            hov = self.hover_fx.iter().find(|x| x.0 == item).map_or(0.0, |x| x.1 * x.1 * (3.0 - 2.0 * x.1));
+            // Inside a lit folder (its rect strictly contains ours): lit the same way.
+            for &(g, v) in &self.group_lit {
+                if g != tile.rect && g.contains_rect(tile.rect) {
+                    hov = hov.max(v);
+                }
             }
         }
         insts.push(Inst {
             rect: [r.min.x, r.min.y, r.max.x, r.max.y],
-            color: [col[0], col[1], col[2], if dim { DIM } else { 1.0 }],
-            p: [gfx::FIELD, 0.0, lo as f32, hi as f32],
+            color: [col[0], col[1], col[2], 1.0],
+            p: [gfx::FIELD, tile.solid as u8 as f32, lo as f32, hi as f32],
             q: [if tile.open { self.header } else { 0.0 }, hov, tile.tone as f32 / (layout::TONES - 1) as f32, 0.0],
             t: gfx::NO_TEXT,
         });
         let inst = insts.len() - 1;
         let Some(fixed) = label else { return };
-        let alpha = if dim { 0.35 } else { 0.92 };
         let lr = tile.rect;
         if tile.open {
             labels.push(Label {
@@ -1242,7 +1163,6 @@ impl App {
                 sub: String::new(),
                 room: Vec2::ZERO,
                 size: 11.5,
-                alpha,
                 inst,
             });
         } else if (!is_dir || tile.titled) && lr.width() > 24.0 && lr.height() > 24.0 {
@@ -1257,7 +1177,6 @@ impl App {
                 sub: fmt_size(size),
                 room: lr.shrink(3.0).size(),
                 size: if lr.height() > 60.0 && lr.width() > 110.0 { 13.0 } else { 11.0 },
-                alpha,
                 inst,
             });
         }
@@ -1302,9 +1221,10 @@ fn supports_mailbox(cc: &eframe::CreationContext, rs: &eframe::egui_wgpu::Render
     surface.get_capabilities(&rs.adapter).present_modes.contains(&wgpu::PresentMode::Mailbox)
 }
 
-/// Toolbar button; `key`: its shortcut was pressed (only acts when enabled).
+/// Toolbar button with a Segoe Fluent / MDL2 glyph; `key`: its shortcut was pressed (only acts when enabled).
 fn tool(ui: &mut egui::Ui, icon: &str, tip: &str, enabled: bool, key: bool) -> bool {
-    let clicked = ui.add_enabled(enabled, egui::Button::new(RichText::new(icon).size(17.0)).min_size(vec2(32.0, 28.0))).on_hover_text(tip).clicked();
+    let icon = RichText::new(icon).size(15.0).family(egui::FontFamily::Name("icons".into()));
+    let clicked = ui.add_enabled(enabled, egui::Button::new(icon).min_size(vec2(32.0, 28.0))).on_hover_text(tip).clicked();
     enabled && (clicked || key)
 }
 
@@ -1321,9 +1241,12 @@ fn setup_style(ctx: &egui::Context) {
         s.visuals.widgets.active.corner_radius = CornerRadius::same(7);
         s.visuals.window_corner_radius = CornerRadius::same(12);
         s.spacing.button_padding = vec2(8.0, 4.0);
+        // Text is display only (text fields still select).
+        s.interaction.selectable_labels = false;
     });
     // No bundled fonts (keeps the exe small): Segoe UI for Latin, Microsoft YaHei for CJK file
-    // names, Segoe UI Symbol for the toolbar/menu icons.
+    // names, Segoe UI Symbol for menu symbols; toolbar icons from Segoe Fluent Icons (Windows 11)
+    // or Segoe MDL2 Assets (Windows 10), which share code points.
     let mut fonts = egui::FontDefinitions::empty();
     let mut list = vec![];
     for file in ["segoeui.ttf", "msyh.ttc", "seguisym.ttf"] {
@@ -1332,6 +1255,12 @@ fn setup_style(ctx: &egui::Context) {
             list.push(file.to_string());
         }
     }
+    let mut icons = vec![];
+    if let Some((file, bytes)) = ["SegoeIcons.ttf", "segmdl2.ttf"].iter().find_map(|f| Some((f, std::fs::read(format!(r"C:\Windows\Fonts\{f}")).ok()?))) {
+        fonts.font_data.insert(file.to_string(), egui::FontData::from_owned(bytes).into());
+        icons.push(file.to_string());
+    }
+    fonts.families.insert(egui::FontFamily::Name("icons".into()), icons.into_iter().chain(list.clone()).collect());
     fonts.families.insert(egui::FontFamily::Proportional, list.clone());
     fonts.families.insert(egui::FontFamily::Monospace, list);
     ctx.set_fonts(fonts);
@@ -1423,19 +1352,6 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn filter_terms() {
-        let f = Filter::parse("*.mp4; >1mb");
-        assert!(f.matches("Movie.MP4", 5 << 20));
-        assert!(!f.matches("Movie.mp4", 10));
-        assert!(!f.matches("a.mkv", 5 << 20));
-        assert!(Filter::parse("cache").matches("npm-cache.bin", 1));
-        assert!(Filter::parse("<1kb").matches("x", 100));
-        assert!(glob(b"a*b?c", b"axxbyc"));
-        assert!(!glob(b"a*b?c", b"axxbc"));
-        assert_eq!(parse_size("1.5gb"), Some((1.5 * (1u64 << 30) as f64) as u64));
-    }
 
     /// The transition wave starts at 0, finishes at 1, sweeps outward from its origin, leaves
     /// the outside of its rect alone, and drives the typewriter labels.
