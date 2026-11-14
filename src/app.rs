@@ -135,42 +135,107 @@ fn ease_hover(direct: &mut Vec<(Item, f32)>, groups: &mut Vec<(Item, f32)>, lit:
     groups.retain(|x| x.1 > 0.0);
 }
 
-#[derive(Clone, Copy)]
-enum Kind {
-    /// Zoom into a child whose tile was `small` in the old layout.
-    In { small: Rect, click: Pos2 },
-    /// Zoom out; the old view sits at `small` in the new layout.
-    Out { small: Rect },
-    /// Expand/collapse in place (the wave crosses the whole view; unchanged tiles stay still).
-    Local { click: Pos2 },
-    /// Unrelated jump (back/forward across branches).
-    Swap,
+/// Axis-aligned map taking rect `.0` onto rect `.1` (scale and offset per axis).
+type Map = (Rect, Rect);
+
+fn apply(m: Map, p: Pos2) -> Pos2 {
+    m.1.min + (p - m.0.min) * (m.1.size() / m.0.size())
 }
 
-struct Anim {
+fn apply_rect(m: Map, r: Rect) -> Rect {
+    Rect::from_min_max(apply(m, r.min), apply(m, r.max))
+}
+
+fn inverse(m: Map) -> Map {
+    (m.1, m.0)
+}
+
+/// `g`, then `f`.
+fn then(g: Map, f: Map) -> Map {
+    (g.0, apply_rect(f, g.1))
+}
+
+/// Camera of the top layout at eased progress `e`, from `v0` (the part of it on screen when the
+/// step began) to rest. Zooming in narrows the view onto `area`; zooming out grows the screen image
+/// of `v0` back, the inverse motion, so both have the same (log-scale) pace. A plain lerp of the
+/// view when zooming in would spend nearly all the perceived zoom in the first few frames.
+fn top_cam(v0: Rect, area: Rect, e: f32) -> Map {
+    if v0.area() > area.area() { (lerp_rect(v0, area, e), area) } else { (v0, lerp_rect(area, v0, e)) }
+}
+
+/// The part of a new top layout on screen as it takes over: `cam` is the camera of the layout
+/// under it, `rel` maps that layout onto the new one. Starting there, nothing jumps.
+fn view_after(cam: Map, rel: Map, area: Rect) -> Rect {
+    apply_rect(inverse(then(inverse(rel), cam)), area)
+}
+
+/// One transition: brings in the layout above `old` through its own wave.
+struct Step {
+    /// The layout it replaces (the layer under it).
     old: Vec<Tile>,
-    kind: Kind,
+    /// Old layout coords -> new layout coords (zooms: the child's tile <-> the whole view).
+    rel: Map,
+    /// Expand/collapse in place: tiles it leaves unchanged are shared by both layers.
+    local: bool,
     /// Shared element: its title never erases, it rides the camera.
     anchor: Option<Item>,
     t0: f32,
-    /// Start of the pixel wave: `t0`, or earlier when a zoom takes over a running expand's wave.
-    wave_t0: f32,
+    /// The wave, in the new layout's coords: origin, the region it flips, and whether everything
+    /// outside that region is new already.
+    origin: Pos2,
+    rect: Rect,
+    outside: bool,
+}
+
+impl Step {
+    fn k(&self, now: f32) -> f32 {
+        (now - self.t0) / if self.local { LOCAL_SECS } else { ZOOM_SECS }
+    }
+}
+
+/// Transitions never reset or skip: one started mid-way stacks on top. Layer j is `steps[j].old`,
+/// the top one the current tiles; every step's wave keeps running, and each dot cell shows the
+/// layer of the newest wave that has passed it. The camera starts from what is on screen and eases
+/// the top layout to rest; the layers under it follow through each step's `rel`.
+struct Anim {
+    steps: Vec<Step>,
+    /// Top layout's view when the newest step began (see [`top_cam`]).
+    v0: Rect,
 }
 
 impl Anim {
-    fn k(&self, now: f32) -> f32 {
-        let secs = if matches!(self.kind, Kind::Local { .. }) { LOCAL_SECS } else { ZOOM_SECS };
-        (now - self.t0) / secs
+    /// Camera (layout -> screen) of every layer, bottom first.
+    fn cams(&self, area: Rect, now: f32) -> Vec<Map> {
+        let mut c = top_cam(self.v0, area, ease(self.steps.last().map_or(1.0, |s| s.k(now))));
+        let mut cams = vec![c];
+        for s in self.steps.iter().rev() {
+            c = then(s.rel, c);
+            cams.push(c);
+        }
+        cams.reverse();
+        cams
     }
 
-    /// A zoom that took over an expand's wave.
-    fn ridden(&self) -> bool {
-        self.wave_t0 < self.t0
+    /// Every step's wave on screen this frame.
+    fn waves(&self, cams: &[Map], now: f32) -> Vec<Wave> {
+        let w = |(s, &c): (&Step, &Map)| {
+            let (origin, rect) = (apply(c, s.origin), apply_rect(c, s.rect));
+            Wave { origin, maxd: far_corner(origin, rect), k: s.k(now).clamp(0.0, 1.0), rect, outside: s.outside }
+        };
+        self.steps.iter().zip(&cams[1..]).map(w).collect()
     }
 
-    /// Wave progress; a taken-over wave keeps the expand's pace.
-    fn wave_k(&self, now: f32) -> f32 {
-        if self.ridden() { (now - self.wave_t0) / LOCAL_SECS } else { self.k(now) }
+    /// Drop the layers no cell can show any more: everything under a finished wave that covers the
+    /// screen. False once the newest step is done (nothing left but the top layer).
+    fn prune(&mut self, area: Rect, now: f32) -> bool {
+        if self.steps.last().is_none_or(|s| s.k(now) >= 1.0) {
+            return false;
+        }
+        let waves = self.waves(&self.cams(area, now), now);
+        if let Some(i) = waves.iter().rposition(|w| w.k >= 1.0 && (w.outside || w.rect.expand(0.5).contains_rect(area))) {
+            self.steps.drain(..=i);
+        }
+        true
     }
 }
 
@@ -188,14 +253,14 @@ struct Wave {
     maxd: f32,
     k: f32,
     rect: Rect,
-    outside: f32,
+    outside: bool,
 }
 
 impl Wave {
     /// < 0: the front has not reached `p` yet; >= 0: flipped `e` progress units ago.
     fn at(&self, p: Pos2, jitter: f32) -> f32 {
         if !self.rect.contains(p) {
-            return if self.outside > 0.5 { WAVE_COOL } else { -1.0 };
+            return if self.outside { WAVE_COOL } else { -1.0 };
         }
         // Jitter fades in with distance so the click point itself reacts on the very first frame.
         let d = ((p - self.origin).length() / self.maxd.max(1.0)).clamp(0.0, 1.0);
@@ -205,7 +270,7 @@ impl Wave {
 
     fn gpu(&self) -> gfx::Wave {
         let r = self.rect;
-        [[self.origin.x, self.origin.y, self.maxd, self.k], [r.min.x, r.min.y, r.max.x, r.max.y], [self.outside, 0.0, 0.0, 0.0]]
+        [[self.origin.x, self.origin.y, self.maxd, self.k], [r.min.x, r.min.y, r.max.x, r.max.y], [self.outside as u8 as f32, 0.0, 0.0, 0.0]]
     }
 }
 
@@ -228,22 +293,18 @@ fn far_corner(o: Pos2, r: Rect) -> f32 {
     [r.left_top(), r.right_top(), r.left_bottom(), r.right_bottom()].iter().map(|c| (*c - o).length()).fold(0.0, f32::max)
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum LMode {
-    Full,
-    TypeIn,
-    Erase,
-}
-
-/// How much of a label shows for wave value `e` (see [`Wave::at`]), 0..1: an outgoing label fades
-/// out over the stretch just ahead of the front (gone as its dots flip), an incoming one types in
-/// while its cells cool down behind it.
-fn shown(e: f32, mode: LMode) -> f32 {
-    match mode {
-        LMode::Full => 1.0,
-        LMode::TypeIn => (e / WAVE_COOL).clamp(0.0, 1.0),
-        LMode::Erase => (-e / WAVE_COOL).clamp(0.0, 1.0),
+/// How much shows of a label belonging to layers `lo..=hi`, at a spot with wave values `es` (one
+/// per step, see [`Wave::at`]): (typed-in part, opacity), each 0..1; nothing where another layer
+/// shows. A label types in while the cells of the wave that brought it cool down behind the front,
+/// and fades out over the stretch just ahead of the wave that takes it away (gone as its dots flip).
+fn shown(es: &[f32], lo: usize, hi: usize) -> (f32, f32) {
+    let s = es.iter().rposition(|&e| e >= 0.0).map_or(0, |i| i + 1);
+    if s < lo || s > hi {
+        return (0.0, 0.0);
     }
+    let typed = if s == lo && lo > 0 { (es[lo - 1] / WAVE_COOL).clamp(0.0, 1.0) } else { 1.0 };
+    let fade = if s == hi && hi < es.len() { (-es[hi] / WAVE_COOL).clamp(0.0, 1.0) } else { 1.0 };
+    (typed, fade)
 }
 
 /// The first `f` (0..1) of `text`, for typing in.
@@ -340,7 +401,10 @@ struct Particle {
 }
 
 struct Label {
-    mode: LMode,
+    /// Layers it belongs to; `fixed`: a step's shared title, shown whatever the waves do.
+    lo: usize,
+    hi: usize,
+    fixed: bool,
     clip: Rect,
     pos: Pos2,
     text: String,
@@ -378,11 +442,9 @@ pub struct App {
     gpu_info: String,
     hover: Option<Item>,
     menu_item: Option<Item>,
-    /// Last press on the treemap: (time, pos, folder it hit, it expanded/collapsed); a second
-    /// press there soon after zooms into that folder.
-    last_press: Option<(f64, Pos2, u32, bool)>,
-    /// The pending zoom comes from such a second press: it rides the first press's expand wave.
-    ride: bool,
+    /// Last press on the treemap: (time, pos, folder it hit); a second press there soon after
+    /// zooms into that folder.
+    last_press: Option<(f64, Pos2, u32)>,
     /// Dot lattice pitch and folder title height (points) for the current DPI.
     pitch: f32,
     header: f32,
@@ -395,7 +457,7 @@ pub struct App {
     group_fx: Vec<(Item, f32)>,
     group_lit: Vec<(Rect, f32)>,
     /// Camera of the target layout last frame (layout rect -> screen rect), for hit-testing mid-zoom.
-    cam: (Rect, Rect),
+    cam: Map,
     confirm: Option<Item>,
     filter_text: String,
     filter: Filter,
@@ -440,7 +502,6 @@ impl App {
             hover: None,
             menu_item: None,
             last_press: None,
-            ride: false,
             pitch: 3.0,
             header: 15.0,
             hover_fx: vec![],
@@ -680,7 +741,7 @@ impl App {
             out.push(Inst {
                 rect: [p.pos.x - s, p.pos.y - s, p.pos.x + s, p.pos.y + s],
                 color: [p.col[0], p.col[1], p.col[2], k * k * 1.4],
-                p: [gfx::PARTICLE, 3.0, gfx::STATIC, 0.0],
+                p: [gfx::PARTICLE, 3.0, 0.0, 0.0],
                 q: [0.0; 4],
                 t: gfx::NO_TEXT,
             });
@@ -795,7 +856,7 @@ impl App {
                         let block = |rect: Rect, inten: f32, head: f32| Inst {
                             rect: [rect.min.x, rect.min.y, rect.max.x, rect.max.y],
                             color: [FOLDER_RGB[0], FOLDER_RGB[1], FOLDER_RGB[2], inten],
-                            p: [gfx::FIELD, 0.0, gfx::STATIC, 0.0],
+                            p: [gfx::FIELD, 0.0, 0.0, 0.0],
                             q: [head, hov, 0.5, 0.0],
                             t: gfx::NO_TEXT,
                         };
@@ -822,7 +883,7 @@ impl App {
                         }
                     }
                 });
-                ui.painter().set(field, gfx::shape(ui.clip_rect(), insts, 0, gfx::NO_WAVE));
+                ui.painter().set(field, gfx::shape(ui.clip_rect(), insts, 0, &[]));
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     let r = ui.add(egui::TextEdit::singleline(&mut self.path_input).hint_text("C:\\Users").desired_width(400.0));
@@ -850,7 +911,7 @@ impl App {
         }
         let area = layout::snap(area.shrink(1.0), pitch);
         let now = self.now();
-        if self.anim.as_ref().is_some_and(|a| a.k(now) >= 1.0) {
+        if self.anim.as_mut().is_some_and(|a| !a.prune(area, now)) {
             self.anim = None;
         }
 
@@ -867,19 +928,18 @@ impl App {
         let on_title = hit.is_some_and(|(x, p)| x.open && p.y < x.rect.min.y + self.header);
         // A press on any folder expands/collapses it at once (mouse *down*); a second press at the
         // same spot within the double-click time zooms into the folder the first press hit (for a
-        // file: its folder), taking over from the expand animation.
+        // file: its folder), stacking on the expand animation.
         if let Some(pos) = resp.hover_pos().filter(|_| ui.input(|i| i.pointer.primary_pressed())) {
             let time = ui.input(|i| i.time);
             match self.last_press.take() {
-                Some((t0, p0, d, toggled)) if time - t0 < 0.3 && (pos - p0).length() < 6.0 => {
+                Some((t0, p0, d)) if time - t0 < 0.3 && (pos - p0).length() < 6.0 => {
                     if d != self.view {
                         self.click_pos = Some(pos);
-                        self.ride = toggled;
                         self.navigate(d);
                     }
                 }
                 _ => {
-                    let toggled = if let Some(Item::Dir(d)) = hover
+                    if let Some(Item::Dir(d)) = hover
                         && d != self.view
                         && !on_title // the title strip only zooms (double-click), never collapses
                         && toggle(self.tree.as_ref().unwrap(), &mut self.expanded, d, hit_open)
@@ -887,12 +947,9 @@ impl App {
                         self.expand_ver += 1;
                         self.toggled = Some(d);
                         self.click_pos = Some(pos);
-                        true
-                    } else {
-                        false
-                    };
+                    }
                     if let Some(Item::Dir(d) | Item::File(d, _)) = hover {
-                        self.last_press = Some((time, pos, d, toggled));
+                        self.last_press = Some((time, pos, d));
                     }
                 }
             }
@@ -910,41 +967,42 @@ impl App {
                     self.hover_fx.clear();
                     self.group_fx.clear();
                 }
-                let mut old = std::mem::take(&mut self.tiles);
+                let old = std::mem::take(&mut self.tiles);
                 layout::build(t, self.view, area, &self.expanded, self.pitch, &old, &mut self.tiles);
-                // A zoom right after an expand (double-click) takes over that expand's wave instead
-                // of starting a second one: it flips from the pre-expand layout, wave already under way.
-                let mut wave_t0 = now;
-                if std::mem::take(&mut self.ride)
-                    && let Some(a) = self.anim.take_if(|a| matches!(a.kind, Kind::Local { .. }))
-                {
-                    old = a.old;
-                    wave_t0 = a.t0;
-                    if let Kind::Local { click } = a.kind {
-                        self.click_pos = Some(click); // the wave's origin stays the first press
-                    }
-                }
                 let animate = prev.0 != u32::MAX && key.1 == prev.1 && (key.0 != prev.0 || key.3 != prev.3);
                 if animate {
                     let (from, to) = (prev.0, self.view);
-                    let click = self.click_pos.take();
+                    // The old layout's camera right now (mid-transition it is still moving), and the
+                    // click in that layout's coords.
+                    let cam = self.anim.as_ref().map_or((area, area), |a| *a.cams(area, now).last().unwrap());
+                    let click = self.click_pos.take().map(|p| apply(inverse(cam), p));
                     let toggled = self.toggled.take();
-                    let (kind, anchor) = if from == to {
+                    let whole = (area, area);
+                    // (old -> new layout, wave origin and region in the new layout, outside is new, shared element)
+                    let (rel, origin, rect, outside, anchor) = if from == to {
                         let d = toggled.unwrap_or(to);
                         let at = find_rect(t, &self.tiles, d).unwrap_or(area).center();
-                        (Kind::Local { click: click.unwrap_or(at) }, Some(Item::Dir(d)))
+                        (whole, click.unwrap_or(at), area, false, Some(Item::Dir(d)))
                     } else if is_ancestor(t, from, to)
                         && let Some(small) = place(t, &old, from, area, &self.expanded, self.pitch, to)
                     {
-                        (Kind::In { small, click: click.filter(|p| small.contains(*p)).unwrap_or(small.center()) }, Some(Item::Dir(to)))
+                        // Zoom in: the child's tile becomes the view; the wave flips inside it only.
+                        let rel = (small, area);
+                        (rel, apply(rel, click.filter(|p| small.contains(*p)).unwrap_or(small.center())), area, false, Some(Item::Dir(to)))
                     } else if is_ancestor(t, to, from)
                         && let Some(small) = place(t, &self.tiles, to, area, &self.expanded, self.pitch, from)
                     {
-                        (Kind::Out { small }, Some(Item::Dir(from)))
+                        // Zoom out: the old view shrinks to its tile; everything around it is new at once.
+                        ((area, small), small.center(), small, true, Some(Item::Dir(from)))
                     } else {
-                        (Kind::Swap, None)
+                        (whole, area.center(), area, false, None)
                     };
-                    self.anim = Some(Anim { old, kind, anchor, t0: now, wave_t0 });
+                    let a = self.anim.get_or_insert_with(|| Anim { steps: vec![], v0: area });
+                    a.v0 = view_after(cam, rel, area);
+                    a.steps.push(Step { old, rel, local: from == to, anchor, t0: now, origin, rect, outside });
+                    if a.steps.len() > gfx::MAX_WAVES {
+                        a.steps.remove(0); // shortcut: the oldest layer flips at once; needs 5 clicks inside one transition
+                    }
                 } else if structural {
                     self.anim = None;
                 }
@@ -974,79 +1032,34 @@ impl App {
         let t = self.tree.as_ref().unwrap();
         let mut insts = Vec::with_capacity(self.tiles.len() * 2 + 8);
         let mut labels = vec![];
-        let mut wave = None;
-        if let Some(a) = &self.anim {
-            let k = a.k(now).clamp(0.0, 1.0);
-            let e = ease(k);
-            // r: where the zooming view currently sits; old/new: camera maps for each layer.
-            let (r, origin, outside, old_cam, new_cam) = match a.kind {
-                Kind::In { small, click } => {
-                    // Camera = inverse of Out's camera at the same eased progress, so zooming in has
-                    // the same (log-scale) pace as zooming out. A plain lerp of `small` would spend
-                    // nearly all the perceived zoom in the first few frames.
-                    let m = lerp_rect(area, small, e);
-                    let inv = |p: Pos2| area.min + (p - m.min) * (area.size() / m.size());
-                    let r = Rect::from_min_max(inv(small.min), inv(small.max));
-                    (r, r.min + (click - small.min) * (r.size() / small.size()), 0.0, (small, r), (area, r))
-                }
-                Kind::Out { small } => {
-                    let r = lerp_rect(area, small, e);
-                    (r, r.center(), 1.0, (area, r), (small, r))
-                }
-                Kind::Local { click } => (area, click, 0.0, (area, area), (area, area)),
-                Kind::Swap => (area, area.center(), 0.0, (area, area), (area, area)),
-            };
-            // A taken-over wave stays measured in the expand's frame (whole view, first click), carried
-            // by the old layer's camera, so its front doesn't jump; it still only flips inside `r`.
-            let (origin, maxd) = match a.kind {
-                Kind::In { click, .. } if a.ridden() => {
-                    let (f, to) = old_cam;
-                    let map = |p: Pos2| to.min + (p - f.min) * (to.size() / f.size());
-                    let o = map(click);
-                    (o, far_corner(o, Rect::from_min_max(map(area.min), map(area.max))))
-                }
-                _ => (origin, far_corner(origin, r)),
-            };
-            let w = Wave { origin, maxd, k: a.wave_k(now).clamp(0.0, 1.0), rect: r, outside };
-            if let Kind::Local { .. } = a.kind {
-                // Only tiles whose rect or open-state changed go through the wave; the rest are
-                // drawn untouched underneath (they are the ancestors/neighbours of what changed).
-                type At = HashMap<Item, (Rect, bool)>;
-                let at = |tiles: &[Tile]| -> At { tiles.iter().map(|x| (x.item, (x.rect, x.open))).collect() };
-                let (old_at, new_at) = (at(&a.old), at(&self.tiles));
-                let kept = |x: &Tile, other: &At| other.get(&x.item) == Some(&(x.rect, x.open));
-                self.layer(t, self.tiles.iter().filter(|x| kept(x, &old_at)), new_cam, 0.0, None, &mut insts, &mut labels);
-                self.layer(t, a.old.iter().filter(|x| !kept(x, &new_at)), old_cam, gfx::OUTGOING, a.anchor, &mut insts, &mut labels);
-                self.layer(t, self.tiles.iter().filter(|x| !kept(x, &old_at)), new_cam, gfx::INCOMING, a.anchor, &mut insts, &mut labels);
-            } else if matches!(a.kind, Kind::Out { .. }) {
-                // Zooming out the parent (new) surrounds the shrinking child (old): draw it first.
-                self.layer(t, &self.tiles, new_cam, gfx::INCOMING, a.anchor, &mut insts, &mut labels);
-                self.layer(t, &a.old, old_cam, gfx::OUTGOING, a.anchor, &mut insts, &mut labels);
-            } else {
-                self.layer(t, &a.old, old_cam, gfx::OUTGOING, a.anchor, &mut insts, &mut labels);
-                self.layer(t, &self.tiles, new_cam, gfx::INCOMING, a.anchor, &mut insts, &mut labels);
+        let (steps, cams, waves) = match &self.anim {
+            Some(a) => {
+                let cams = a.cams(area, now);
+                let waves = a.waves(&cams, now);
+                (&a.steps[..], cams, waves)
             }
-            wave = Some(w);
-            self.cam = new_cam;
-        } else {
-            self.layer(t, &self.tiles, (area, area), 0.0, None, &mut insts, &mut labels);
-            self.cam = (area, area);
-        }
+            None => (&[][..], vec![(area, area)], vec![]),
+        };
+        self.layers(t, steps, &cams, &mut insts, &mut labels);
+        self.cam = *cams.last().unwrap();
         let painter = ui.painter().with_clip_rect(area.expand(1.0).intersect(ui.clip_rect()));
         // The pixel layer goes under the labels, but its quiet zones are only known once the labels
         // are laid out: reserve its place in the paint order now, fill it in after.
         let field = painter.add(egui::Shape::Noop);
         for l in labels {
-            let e = wave.as_ref().map(|w| w.at(l.pos, ((l.pos.x * 12.9898 + l.pos.y * 78.233).sin() * 43758.547).fract().abs()));
+            let jitter = ((l.pos.x * 12.9898 + l.pos.y * 78.233).sin() * 43758.547).fract().abs();
+            let es: Vec<f32> = waves.iter().map(|w| w.at(l.pos, jitter)).collect();
             // Outgoing labels fade as a whole, incoming ones type in; the dark patch under a file
             // label follows the same amount, so it never outstays (or precedes) its text.
-            let f = e.map_or(1.0, |e| shown(e, l.mode));
-            let fade = if l.mode == LMode::Erase { f } else { 1.0 };
-            let typed = |s: &str| if l.mode == LMode::TypeIn { typed(s, f) } else { s.to_string() };
+            let (f_in, fade) = if l.fixed { (1.0, 1.0) } else { shown(&es, l.lo, l.hi) };
+            if f_in * fade <= 0.0 {
+                continue;
+            }
+            let typed = |s: &str| typed(s, f_in);
             // Static labels always fit their tile, so they share the treemap's clip and egui draws all
             // text in one batch; only mid-transition (tiles resizing under them) are they clipped
             // per tile. No shadow: labels sit on a dark title strip or a dimmed quiet zone.
-            let p = if wave.is_some() { painter.with_clip_rect(l.clip.intersect(painter.clip_rect())) } else { painter.clone() };
+            let p = if !waves.is_empty() { painter.with_clip_rect(l.clip.intersect(painter.clip_rect())) } else { painter.clone() };
             let font = FontId::proportional(l.size);
             let white = Color32::from_white_alpha((l.alpha * fade * 255.0) as u8);
             if l.sub.is_empty() {
@@ -1073,14 +1086,14 @@ impl App {
             }
             let bx = Rect::from_center_size(l.pos, vec2(full.size().x.max(sub.size().x), full.size().y + sub.size().y));
             insts[l.inst].t = [bx.min.x, bx.min.y, bx.max.x, bx.max.y];
-            insts[l.inst].q[3] = f;
+            insts[l.inst].q[3] = f_in * fade;
             let (name, sub) = (wrapped(typed(&l.text)), p.layout_no_wrap(typed(&l.sub), font.clone(), white));
             let top = l.pos.y - (full.size().y + sub.size().y) * 0.5;
             for (g, y) in [(name, top), (sub, top + full.size().y)] {
                 p.galley(pos2(l.pos.x, y) - g.rect.center_top().to_vec2(), g, white);
             }
         }
-        painter.set(field, gfx::shape(area, insts, 1, wave.as_ref().map_or(gfx::NO_WAVE, Wave::gpu)));
+        painter.set(field, gfx::shape(area, insts, 1, &waves.iter().map(Wave::gpu).collect::<Vec<_>>()));
 
         // Interaction.
         // Own tooltip instead of egui's: shown at once and kept up while the tiles change under a
@@ -1153,36 +1166,38 @@ impl App {
         }
     }
 
-    /// Draw `tiles` under the camera map `cam` (layout rect -> screen rect) with a transition role.
-    #[allow(clippy::too_many_arguments)]
-    fn layer<'a>(&self, t: &Tree, tiles: impl IntoIterator<Item = &'a Tile>, cam: (Rect, Rect), role: f32, anchor: Option<Item>, insts: &mut Vec<Inst>, labels: &mut Vec<Label>) {
-        let (from, to) = cam;
-        let s = to.size() / from.size();
-        let mode = if role == gfx::INCOMING {
-            LMode::TypeIn
-        } else if role == gfx::OUTGOING {
-            LMode::Erase
-        } else {
-            LMode::Full
-        };
-        for tile in tiles {
-            let shared = anchor == Some(tile.item);
-            // The shared title is drawn once, by the incoming layer, untouched by the wave.
-            let mode = match (shared, mode) {
-                (true, LMode::Erase) => None,
-                (true, _) => Some(LMode::Full),
-                (false, m) => Some(m),
-            };
-            self.draw(t, tile, from, to, s, role, mode, insts, labels);
+    /// Draw the layer stack: layer j (`steps[j].old`, the top one the current tiles) under camera
+    /// `cams[j]`. A tile an expand/collapse left unchanged belongs to both layers around it: drawn
+    /// once, untouched by that wave.
+    fn layers(&self, t: &Tree, steps: &[Step], cams: &[Map], insts: &mut Vec<Inst>, labels: &mut Vec<Label>) {
+        let n = steps.len();
+        let layer = |j: usize| if j < n { &steps[j].old[..] } else { &self.tiles[..] };
+        let local = |j: usize| j < n && steps[j].local;
+        let at: Vec<Option<HashMap<Item, (Rect, bool)>>> =
+            (0..=n).map(|j| (local(j) || (j > 0 && local(j - 1))).then(|| layer(j).iter().map(|x| (x.item, (x.rect, x.open))).collect())).collect();
+        let same = |j: usize, x: &Tile| at[j].as_ref().is_some_and(|m| m.get(&x.item) == Some(&(x.rect, x.open)));
+        for j in 0..=n {
+            for x in layer(j) {
+                if j > 0 && local(j - 1) && same(j - 1, x) {
+                    continue; // drawn with the layer below
+                }
+                let mut hi = j;
+                while local(hi) && same(hi + 1, x) {
+                    hi += 1;
+                }
+                // A step's shared title is drawn once, by the layer it leads to, untouched by its wave.
+                let label = if hi < n && steps[hi].anchor == Some(x.item) { None } else { Some(j > 0 && steps[j - 1].anchor == Some(x.item)) };
+                self.draw(t, x, cams[j], (j, hi), label, insts, labels);
+            }
         }
     }
 
-    /// One tile, camera-mapped. Label visibility is decided in layout space so the camera
-    /// never makes labels pop. Tolerates stale items.
+    /// One tile, camera-mapped, belonging to layers `lo..=hi`; `label`: none, or whether it is
+    /// fixed (see [`Label`]). Label visibility is decided in layout space so the camera never makes
+    /// labels pop. Tolerates stale items.
     #[allow(clippy::too_many_arguments)]
-    fn draw(&self, t: &Tree, tile: &Tile, from: Rect, to: Rect, s: Vec2, role: f32, mode: Option<LMode>, insts: &mut Vec<Inst>, labels: &mut Vec<Label>) {
-        let map = |p: Pos2| to.min + (p - from.min) * s;
-        let r = Rect::from_min_max(map(tile.rect.min), map(tile.rect.max));
+    fn draw(&self, t: &Tree, tile: &Tile, cam: Map, (lo, hi): (usize, usize), label: Option<bool>, insts: &mut Vec<Inst>, labels: &mut Vec<Label>) {
+        let r = apply_rect(cam, tile.rect);
         if r.width() <= 0.0 || r.height() <= 0.0 {
             return;
         }
@@ -1208,17 +1223,19 @@ impl App {
         insts.push(Inst {
             rect: [r.min.x, r.min.y, r.max.x, r.max.y],
             color: [col[0], col[1], col[2], if dim { DIM } else { 1.0 }],
-            p: [gfx::FIELD, 0.0, role, 0.0],
+            p: [gfx::FIELD, 0.0, lo as f32, hi as f32],
             q: [if tile.open { self.header } else { 0.0 }, hov, tile.tone as f32 / (layout::TONES - 1) as f32, 0.0],
             t: gfx::NO_TEXT,
         });
         let inst = insts.len() - 1;
-        let Some(mode) = mode else { return };
+        let Some(fixed) = label else { return };
         let alpha = if dim { 0.35 } else { 0.92 };
         let lr = tile.rect;
         if tile.open {
             labels.push(Label {
-                mode,
+                lo,
+                hi,
+                fixed,
                 clip: Rect::from_min_max(r.min, pos2(r.max.x - 2.0, (r.min.y + self.header).min(r.max.y))),
                 pos: pos2(r.min.x + 4.0, r.min.y + self.header * 0.5),
                 text: format!("{} - {}", name, fmt_size(size)),
@@ -1231,7 +1248,9 @@ impl App {
         } else if (!is_dir || tile.titled) && lr.width() > 24.0 && lr.height() > 24.0 {
             // Files and closed folders: name (up to 2 lines) and size inside.
             labels.push(Label {
-                mode,
+                lo,
+                hi,
+                fixed,
                 clip: r.shrink(2.0),
                 pos: r.center(),
                 text: name.to_string(),
@@ -1368,7 +1387,7 @@ impl eframe::App for App {
                 }
                 self.treemap(ui);
                 let parts = self.step_particles(dt);
-                gfx::paint(ui.painter(), ui.clip_rect(), parts, 2, gfx::NO_WAVE);
+                gfx::paint(ui.painter(), ui.clip_rect(), parts, 2, &[]);
             });
 
         self.delete_modal(&ctx);
@@ -1424,21 +1443,62 @@ mod tests {
     fn wave_and_typing() {
         let r = Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 100.0));
         let o = pos2(0.0, 0.0);
-        let w = |k| Wave { origin: o, maxd: far_corner(o, r), k, rect: r, outside: 0.0 };
+        let w = |k| Wave { origin: o, maxd: far_corner(o, r), k, rect: r, outside: false };
         assert!(w(0.0).at(pos2(50.0, 50.0), 0.5) < 0.0);
         // Everything has flipped and fully cooled by the end, even the far corner.
         assert!(w(1.0).at(pos2(99.0, 99.0), 1.0) >= WAVE_COOL);
         assert!(w(0.0).at(pos2(0.0, 0.0), 0.0) >= 0.0, "the click point flips on the first frame");
         assert!(w(0.4).at(pos2(5.0, 5.0), 0.0) > w(0.4).at(pos2(90.0, 90.0), 0.0));
         assert!(w(0.9).at(pos2(150.0, 0.0), 0.0) < 0.0);
-        assert_eq!(typed("abcd", shown(0.0, LMode::TypeIn)), "");
-        assert_eq!(typed("abcd", shown(WAVE_COOL * 0.5, LMode::TypeIn)), "ab");
-        assert_eq!(typed("abcd", shown(WAVE_COOL, LMode::TypeIn)), "abcd");
+        // Incoming (layer 1 of 2) types in as its cells cool.
+        assert_eq!(typed("abcd", shown(&[0.0], 1, 1).0), "");
+        assert_eq!(typed("abcd", shown(&[WAVE_COOL * 0.5], 1, 1).0), "ab");
+        assert_eq!(typed("abcd", shown(&[WAVE_COOL], 1, 1).0), "abcd");
         // Outgoing: whole until the fade starts, half gone halfway, gone as the front arrives.
-        assert_eq!(shown(-1.0, LMode::Erase), 1.0);
-        assert_eq!(shown(-WAVE_COOL * 0.5, LMode::Erase), 0.5);
-        assert_eq!(shown(0.0, LMode::Erase), 0.0);
-        assert_eq!(shown(0.3, LMode::Full), 1.0);
+        assert_eq!(shown(&[-1.0], 0, 0), (1.0, 1.0));
+        assert_eq!(shown(&[-WAVE_COOL * 0.5], 0, 0), (1.0, 0.5));
+        assert_eq!(shown(&[0.0], 0, 0).1, 0.0);
+        // Shared by both layers (unchanged by an expand): untouched. No transition: full.
+        assert_eq!(shown(&[0.1], 0, 1), (1.0, 1.0));
+        assert_eq!(shown(&[], 0, 0), (1.0, 1.0));
+        // Stacked: where the newer wave has passed, only the top layer shows, even if the older
+        // one has not got there yet; where only the older one has, the middle layer does.
+        assert_eq!(shown(&[-0.5, WAVE_COOL], 2, 2), (1.0, 1.0));
+        assert_eq!(shown(&[-0.5, WAVE_COOL], 0, 0).1, 0.0);
+        assert_eq!(shown(&[WAVE_COOL, -1.0], 1, 1), (1.0, 1.0));
+        assert_eq!(shown(&[WAVE_COOL, -1.0], 2, 2).1, 0.0);
+    }
+
+    /// Interrupting a zoom never makes anything jump: zoom into a child, then halfway back out
+    /// (and in again), and every layer stays where it was on screen at the moment of the switch.
+    /// Each zoom still ends at rest.
+    #[test]
+    fn interrupted_zooms_continue_from_the_screen() {
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let small = Rect::from_min_size(pos2(500.0, 100.0), vec2(200.0, 100.0)); // child's tile in the parent
+        let tile = Rect::from_min_size(pos2(520.0, 120.0), vec2(30.0, 20.0)); // a tile in the parent
+        let close = |a: Rect, b: Rect| (a.min - b.min).length() + (a.max - b.max).length() < 1e-2;
+        let rest = (area, area);
+        // Zoom in from rest (parent -> child); at rest nothing moves.
+        let rel_in = (small, area);
+        let v0 = view_after(rest, rel_in, area);
+        assert!(close(apply_rect(then(rel_in, top_cam(v0, area, 0.0)), tile), tile));
+        assert!(close(top_cam(v0, area, 1.0).0, area) && close(top_cam(v0, area, 1.0).1, area));
+        let cam_child = top_cam(v0, area, ease(0.4));
+        let on_screen = apply_rect(then(rel_in, cam_child), tile);
+        // Back out (child -> parent) at 40 %: the parent tile is still where it was.
+        let rel_out = (area, small);
+        let v1 = view_after(cam_child, rel_out, area);
+        let cam_parent = top_cam(v1, area, 0.0);
+        assert!(close(apply_rect(cam_parent, tile), on_screen));
+        // ... and the child layer under it too (it follows through `rel_out`).
+        assert!(close(apply_rect(then(rel_out, cam_parent), area), apply_rect(cam_child, area)));
+        let mid = top_cam(v1, area, ease(0.3));
+        // Forward again at 30 % of the way back.
+        let v2 = view_after(mid, rel_in, area);
+        assert!(close(apply_rect(then(rel_in, top_cam(v2, area, 0.0)), tile), apply_rect(mid, tile)));
+        let end = top_cam(v2, area, 1.0);
+        assert!(close(end.0, area) && close(end.1, area));
     }
 
     /// Root (1) > mid (2) > inner (3) title strips: whichever way and however fast the pointer

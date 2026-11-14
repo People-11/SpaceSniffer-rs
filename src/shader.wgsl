@@ -4,24 +4,25 @@
 // Transitions are done by the dot matrix itself (no alpha cross-fades): a wave sweeps from the
 // click point; as it passes, each dot cell flips from the old layer to the new one in place. The
 // front carries light: it lifts the levels of the dots around it, which then cool back down.
-// A cell is never empty, so the front has no dark gap.
+// A cell is never empty, so the front has no dark gap. A transition started mid-way stacks: each
+// cell shows the layer of the newest wave that has passed it, while the older waves run on.
 
 struct U {
     origin: vec2f,
     size: vec2f,
     ppp: f32,
-    _pad0: f32,
+    nw: f32,      // number of waves (0: no transition)
     _pad: vec2f,
-    wave: vec4f,  // origin.xy, max distance, progress K (0..1)
-    wrect: vec4f, // region the wave acts on (min.xy, max.xy)
-    wopt: vec4f,  // x = progress outside wrect
+    // Per wave, 3 vec4s: origin.xy, max distance, progress K (0..1); region it acts on (min.xy,
+    // max.xy); x = 1 if outside that region is new already.
+    w: array<vec4f, 12>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 
 struct Inst {
     @location(0) rect: vec4f,  // min.xy, max.xy (points, screen space)
     @location(1) color: vec4f, // rgb, intensity
-    @location(2) p: vec4f,     // kind, glow radius(pt), role (0 static, 1 incoming, 2 outgoing), unused
+    @location(2) p: vec4f,     // kind, glow radius(pt), first and last transition layer it belongs to
     @location(3) q: vec4f,     // header h(pt), hover, tone (0..1), label visibility (0..1)
     @location(4) t: vec4f,     // label box (min.xy, max.xy); empty = none
 };
@@ -42,7 +43,7 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> V {
         vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(0.0, 1.0),
         vec2f(0.0, 1.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0),
     );
-    let g = i.p.w;
+    let g = i.p.y;
     let pt = mix(i.rect.xy - g, i.rect.zw + g, corners[vi]);
     let ndc = (pt - u.origin) / u.size * 2.0 - 1.0;
     var o: V;
@@ -71,15 +72,17 @@ fn sd_box(p: vec2f, half: vec2f, r: f32) -> f32 {
 // Must match WAVE_COOL in app.rs: how long (in progress units) a flipped cell stays hot.
 const COOL: f32 = 0.3;
 
-// Wave at screen point p: how far past this spot the front is. < 0: still old; >= 0: new, and
+// Wave i at screen point p: how far past this spot the front is. < 0: still old; >= 0: new, and
 // e / COOL is how far it has cooled. Distance from the origin plus the dot's Bayer threshold gives
 // each spot its delay, so the front is an ordered-dither band, not random grain.
-fn wave_e(p: vec2f, cs: f32) -> f32 {
-    if (any(p < u.wrect.xy) || any(p > u.wrect.zw)) { return select(-1.0, COOL, u.wopt.x > 0.5); }
-    let d = clamp(length(p - u.wave.xy) / max(u.wave.z, 1.0), 0.0, 1.0);
+fn wave_e(i: u32, p: vec2f, cs: f32) -> f32 {
+    let w = u.w[i * 3u];
+    let r = u.w[i * 3u + 1u];
+    if (any(p < r.xy) || any(p > r.zw)) { return select(-1.0, COOL, u.w[i * 3u + 2u].x > 0.5); }
+    let d = clamp(length(p - w.xy) / max(w.z, 1.0), 0.0, 1.0);
     // The band fades in with distance so the click point itself reacts on the very first frame.
     let thr = d * 0.8 + bayer4(floor(p * u.ppp / cs)) * 0.2 * min(d * 4.0, 1.0);
-    return u.wave.w * (1.0 + COOL) - thr;
+    return w.w * (1.0 + COOL) - thr;
 }
 
 @fragment
@@ -89,7 +92,8 @@ fn fs(v: V) -> @location(0) vec4f {
     let col = v.color.rgb;
     let inten = v.color.a;
     let hover = v.q.y;
-    let role = u32(v.p.z);
+    let lo = u32(v.p.z);
+    let hi = u32(v.p.w);
 
     // Dot lattice fixed to the screen, in physical pixels: like an LED matrix, the dots never
     // move or scale; zooming tiles slide their colours across it. Tiles at rest sit exactly on it.
@@ -97,17 +101,29 @@ fn fs(v: V) -> @location(0) vec4f {
     let cs = max(2.0, floor(2.0 * u.ppp)); // = layout::grid() * ppp
     let gp = v.pt * u.ppp;
     let cell = floor(gp / cs);
-    // Transition: each screen cell belongs to exactly one layer (both layers evaluate the same
-    // cell centre), so the two never overlap or leave a hole, even while the camera zooms.
-    // Light of the wave front: rises on the old layer just ahead of it, cools on the new one.
+    // Transition: each screen cell belongs to exactly one layer (every layer evaluates the same
+    // cell centre), so they never overlap or leave a hole, even while the camera zooms.
+    // Light of a wave front: rises on the layer it takes away just ahead of it, cools on the one it
+    // brings. A tile shared by several layers is only lit by the waves at its ends.
     var born = 0.0;
-    if (role != 0u) {
+    let nw = u32(u.nw);
+    if (nw > 0u) {
         let sc = (floor(v.pt * u.ppp / cs) + 0.5) * cs / u.ppp;
-        let e = wave_e(sc, cs);
-        if ((role == 2u) == (e >= 0.0)) { discard; }
-        let c = 1.0 - clamp(e / COOL, 0.0, 1.0);
-        let ahead = clamp(1.0 + e / (COOL * 0.25), 0.0, 1.0);
-        born = select(ahead * ahead, c * c, role == 1u);
+        var es = array<f32, 4>(-1.0, -1.0, -1.0, -1.0);
+        var s = 0u; // layer shown here: the newest wave passed
+        for (var i = 0u; i < nw; i++) {
+            es[i] = wave_e(i, sc, cs);
+            if (es[i] >= 0.0) { s = i + 1u; }
+        }
+        if (s < lo || s > hi) { discard; }
+        if (s == lo && lo > 0u) {
+            let c = 1.0 - clamp(es[lo - 1u] / COOL, 0.0, 1.0);
+            born = c * c;
+        }
+        if (s == hi && hi < nw) {
+            let ahead = clamp(1.0 + es[hi] / (COOL * 0.25), 0.0, 1.0);
+            born = max(born, ahead * ahead);
+        }
     }
 
     let half = (v.rect.zw - v.rect.xy) * 0.5;

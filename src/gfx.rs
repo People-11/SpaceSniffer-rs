@@ -11,7 +11,7 @@ use wgpu::util::DeviceExt;
 pub struct Inst {
     pub rect: [f32; 4],
     pub color: [f32; 4],
-    /// kind (FIELD / PARTICLE), glow radius (pt), transition role (STATIC / INCOMING / OUTGOING), unused.
+    /// kind (FIELD / PARTICLE), glow radius (pt), first and last transition layer it belongs to.
     pub p: [f32; 4],
     /// Title strip height (pt), hover 0..1, tone 0..1, label visibility 0..1 (scales the label box's dimming).
     pub q: [f32; 4],
@@ -21,12 +21,10 @@ pub struct Inst {
 
 pub const NO_TEXT: [f32; 4] = [0.0, 0.0, -1.0, -1.0];
 
-pub const STATIC: f32 = 0.0;
-pub const INCOMING: f32 = 1.0;
-pub const OUTGOING: f32 = 2.0;
-/// Wave uniform (origin.xy, max dist, K), wave rect, (progress outside rect). K > 1: settled.
+/// One transition wave: (origin.xy, max dist, progress 0..1), wave rect, (outside the rect is new: 0/1).
 pub type Wave = [[f32; 4]; 3];
-pub const NO_WAVE: Wave = [[0.0, 0.0, 1.0, 2.0], [0.0; 4], [1.0, 0.0, 0.0, 0.0]];
+/// Waves one draw can carry (a transition stack of up to MAX_WAVES + 1 layers).
+pub const MAX_WAVES: usize = 4;
 
 pub const FIELD: f32 = 0.0;
 pub const PARTICLE: f32 = 2.0;
@@ -37,8 +35,9 @@ struct Uniform {
     origin: [f32; 2],
     size: [f32; 2],
     ppp: f32,
-    _pad: [f32; 3],
-    wave: Wave,
+    nw: f32,
+    _pad: [f32; 2],
+    waves: [Wave; MAX_WAVES],
 }
 
 /// Each callback in a frame gets its own slot so their buffers don't overwrite each other.
@@ -140,7 +139,8 @@ struct Draw {
     insts: Vec<Inst>,
     rect: egui::Rect,
     slot: usize,
-    wave: Wave,
+    waves: [Wave; MAX_WAVES],
+    nw: usize,
 }
 
 impl CallbackTrait for Draw {
@@ -166,8 +166,9 @@ impl CallbackTrait for Draw {
             origin: self.rect.min.into(),
             size: self.rect.size().into(),
             ppp: sd.pixels_per_point,
-            _pad: [0.0; 3],
-            wave: self.wave,
+            nw: self.nw as f32,
+            _pad: [0.0; 2],
+            waves: self.waves,
         };
         queue.write_buffer(&r.ubuf, 0, bytemuck::bytes_of(&u));
         r.count = self.insts.len() as u32;
@@ -185,11 +186,14 @@ impl CallbackTrait for Draw {
 }
 
 /// `slot` must be unique per callback within a frame. The painter's clip rect becomes the scissor.
-pub fn paint(painter: &egui::Painter, rect: egui::Rect, insts: Vec<Inst>, slot: usize, wave: Wave) {
-    painter.add(shape(rect, insts, slot, wave));
+pub fn paint(painter: &egui::Painter, rect: egui::Rect, insts: Vec<Inst>, slot: usize, waves: &[Wave]) {
+    painter.add(shape(rect, insts, slot, waves));
 }
 
 /// The paint callback as a shape, for callers that reserve its place in the paint order first.
-pub fn shape(rect: egui::Rect, insts: Vec<Inst>, slot: usize, wave: Wave) -> egui::Shape {
-    egui_wgpu::Callback::new_paint_callback(rect, Draw { insts, rect, slot, wave }).into()
+/// `waves`: at most MAX_WAVES, oldest first; layer j is shown where wave j-1 is the newest one passed.
+pub fn shape(rect: egui::Rect, insts: Vec<Inst>, slot: usize, waves: &[Wave]) -> egui::Shape {
+    let mut w = [[[0.0; 4]; 3]; MAX_WAVES];
+    w[..waves.len()].copy_from_slice(waves);
+    egui_wgpu::Callback::new_paint_callback(rect, Draw { insts, rect, slot, waves: w, nw: waves.len() }).into()
 }
