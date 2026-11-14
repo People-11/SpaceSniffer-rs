@@ -1,5 +1,5 @@
 // One instance = one rounded rect. The fragment shader procedurally draws the dot-matrix
-// "pixel field" (5 levels, ordered dither), the white-hot discovery flash and additive glow.
+// "pixel field" (5 levels, ordered dither) and the particles' additive glow.
 //
 // Transitions are done by the dot matrix itself (no alpha cross-fades): a wave sweeps from the
 // click point; as it passes, each dot cell flips from the old layer to the new one in place, the
@@ -20,7 +20,7 @@ struct U {
 struct Inst {
     @location(0) rect: vec4f,  // min.xy, max.xy (points, screen space)
     @location(1) color: vec4f, // rgb, intensity
-    @location(2) p: vec4f,     // age(s), unused, kind, glow radius(pt)
+    @location(2) p: vec4f,     // unused, unused, kind, glow radius(pt)
     @location(3) q: vec4f,     // header h(pt), hover, tone (0..1), unused
     @location(4) o: vec4f,     // role: 0 static, 1 incoming, 2 outgoing
     @location(5) t: vec4f,     // label box (min.xy, max.xy); empty = none
@@ -58,12 +58,6 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> V {
     return o;
 }
 
-fn hash(p: vec2f) -> f32 {
-    var x = bitcast<vec2u>(p) * vec2u(1597334673u, 3812015801u);
-    let n = (x.x ^ x.y) * 1597334673u;
-    return f32(n) / 4294967295.0;
-}
-
 // 4x4 Bayer threshold of a dot cell, in (0, 1).
 fn bayer4(c: vec2f) -> f32 {
     var m = array<f32, 16>(0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
@@ -80,20 +74,18 @@ fn sd_box(p: vec2f, half: vec2f, r: f32) -> f32 {
 const COOL: f32 = 0.3;
 
 // Wave at screen point p: how far past this spot the front is. < 0: still old; >= 0: new, and
-// e / COOL is how far it has cooled. Distance from the origin plus clumped noise (3x3-dot clumps)
-// gives each spot its delay.
+// e / COOL is how far it has cooled. Distance from the origin plus the dot's Bayer threshold gives
+// each spot its delay, so the front is an ordered-dither band, not random grain.
 fn wave_e(p: vec2f, cs: f32) -> f32 {
     if (any(p < u.wrect.xy) || any(p > u.wrect.zw)) { return select(-1.0, COOL, u.wopt.x > 0.5); }
-    let clump = floor(p * u.ppp / (cs * 3.0));
     let d = clamp(length(p - u.wave.xy) / max(u.wave.z, 1.0), 0.0, 1.0);
-    // Jitter fades in with distance so the click point itself reacts on the very first frame.
-    let thr = d * 0.8 + hash(clump + vec2f(7.0, 13.0)) * 0.2 * min(d * 4.0, 1.0);
+    // The band fades in with distance so the click point itself reacts on the very first frame.
+    let thr = d * 0.8 + bayer4(floor(p * u.ppp / cs)) * 0.2 * min(d * 4.0, 1.0);
     return u.wave.w * (1.0 + COOL) - thr;
 }
 
 @fragment
 fn fs(v: V) -> @location(0) vec4f {
-    let age = v.p.x;
     let kind = u32(v.p.z);
     let glow = v.p.w;
     let col = v.color.rgb;
@@ -120,14 +112,11 @@ fn fs(v: V) -> @location(0) vec4f {
 
     let half = (v.rect.zw - v.rect.xy) * 0.5;
     let d = sd_box(v.pt - (v.rect.xy + v.rect.zw) * 0.5, half, 0.0);
-    // Freshly discovered: a soft white flash, cooling over ~0.8s.
-    let hot = exp(-age * 4.0);
-
     // Glow outside the rect: alpha 0 => additive under premultiplied blending.
     if (d > 0.0) {
         if (glow <= 0.0) { discard; }
-        let a = (0.55 + hot * 0.5) * inten * exp(-d / (glow * 0.33)) * (1.0 - smoothstep(glow * 0.7, glow, d));
-        return vec4f(mix(col, vec3f(1.0), hot * 0.45) * a, 0.0);
+        let a = 0.55 * inten * exp(-d / (glow * 0.33)) * (1.0 - smoothstep(glow * 0.7, glow, d));
+        return vec4f(col * a, 0.0);
     }
 
     if (kind == 2u) { // particle: additive solid square
@@ -167,7 +156,9 @@ fn fs(v: V) -> @location(0) vec4f {
     var rgb = col * (0.07 + 0.93 * pow(level / 4.0, 1.6));
     rgb *= inten;
 
-    // White-hot: discovery flash and newborn transition dots.
-    rgb = mix(rgb, vec3f(1.0), max(hot * 0.55, born * 0.5));
+    // Newborn transition dots are white-hot, dithered: a share of the dots turns white and they go
+    // out one by one in Bayer order as they cool. Offset matrix so the white set doesn't just
+    // repeat the tile's own pattern.
+    if (bayer4(cell + vec2f(2.0, 1.0)) < born) { rgb = mix(rgb, vec3f(1.0), 0.7); }
     return vec4f(rgb, 1.0);
 }

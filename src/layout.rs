@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn tiles_snap_to_lattice_without_gaps() {
         let mut t = Tree::new("R");
-        t.apply(crate::tree::Batch { id: 0, files: vec![("a".into(), 500), ("b".into(), 300), ("c".into(), 120), ("d".into(), 80)], dirs: vec![] }, 0.0);
+        t.apply(crate::tree::Batch { id: 0, files: vec![("a".into(), 500), ("b".into(), 300), ("c".into(), 120), ("d".into(), 80)], dirs: vec![] });
         let pitch = 8.0 / 3.0; // 150% scaling: 4px dots
         let area = Rect::from_min_size(pos2(10.3, 7.9), vec2(401.0, 299.0));
         let mut out = vec![];
@@ -288,7 +288,7 @@ mod tests {
     fn edge_neighbours_never_share_a_tone() {
         let mut t = Tree::new("R");
         let files = (1..60u64).map(|i| (format!("f{i}").into(), i * i * 1000)).collect();
-        t.apply(crate::tree::Batch { id: 0, files, dirs: vec![] }, 0.0);
+        t.apply(crate::tree::Batch { id: 0, files, dirs: vec![] });
         let mut out = vec![];
         build(&t, 0, Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 600.0)), &HashSet::new(), 3.0, &[], &mut out);
         let vis: Vec<_> = out.iter().filter(|x| !x.open).collect();
@@ -334,7 +334,7 @@ mod tests {
         let mut t = Tree::new(&root);
         let (mut out, mut prev) = (vec![], vec![]);
         while let Ok(crate::tree::Msg::Batch(b)) = scan.rx.recv() {
-            t.apply(b, 0.0);
+            t.apply(b);
             std::mem::swap(&mut out, &mut prev);
             build(&t, 0, Rect::from_min_size(pos2(0.0, 0.0), vec2(1260.0, 680.0)), &HashSet::new(), 8.0 / 3.0, &prev, &mut out);
         }
@@ -347,12 +347,12 @@ mod tests {
         use crate::tree::Batch;
         // root -> x -> A (open by default) holding folder B (closed, depth 3) and 9 files.
         let mut t = Tree::new("R");
-        t.apply(Batch { id: 0, files: vec![], dirs: vec![(1, "x".into())] }, 0.0);
-        t.apply(Batch { id: 1, files: vec![], dirs: vec![(2, "A".into())] }, 0.0);
+        t.apply(Batch { id: 0, files: vec![], dirs: vec![(1, "x".into())] });
+        t.apply(Batch { id: 1, files: vec![], dirs: vec![(2, "A".into())] });
         let files = (1..10u64).map(|i| (format!("f{i}").into(), i * 3000)).collect();
-        t.apply(Batch { id: 2, files, dirs: vec![(3, "B".into())] }, 0.0);
+        t.apply(Batch { id: 2, files, dirs: vec![(3, "B".into())] });
         let files = (1..20u64).map(|i| (format!("b{i}").into(), i * 1000)).collect();
-        t.apply(Batch { id: 3, files, dirs: vec![] }, 0.0);
+        t.apply(Batch { id: 3, files, dirs: vec![] });
         let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 600.0));
         let (mut before, mut after) = (vec![], vec![]);
         build(&t, 0, area, &HashSet::new(), 3.0, &[], &mut before);
@@ -371,7 +371,7 @@ mod tests {
         let mut t = Tree::new("R");
         let mut files = vec![("big".into(), 1_000_000u64)];
         files.extend((0..500).map(|i| (format!("f{i}").into(), 1u64)));
-        t.apply(crate::tree::Batch { id: 0, files, dirs: vec![] }, 0.0);
+        t.apply(crate::tree::Batch { id: 0, files, dirs: vec![] });
         let mut out = vec![];
         build(&t, 0, Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 400.0)), &HashSet::new(), 3.0, &[], &mut out);
         assert_eq!(out.len(), 2, "root + the big file only");

@@ -62,7 +62,6 @@ pub fn category(name: &str) -> u8 {
 pub struct File {
     pub name: Box<str>,
     pub size: u64,
-    pub born: f32,
     pub cat: u8,
 }
 
@@ -74,7 +73,6 @@ pub struct Dir {
     pub nfiles: u64,
     pub dirs: Vec<u32>,
     pub files: Vec<File>,
-    pub born: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -122,8 +120,8 @@ impl Tree {
         }
     }
 
-    pub fn apply(&mut self, b: Batch, now: f32) {
-        let files: Vec<File> = b.files.into_iter().map(|(name, size)| File { cat: category(&name), name, size, born: now }).collect();
+    pub fn apply(&mut self, b: Batch) {
+        let files: Vec<File> = b.files.into_iter().map(|(name, size)| File { cat: category(&name), name, size }).collect();
         let (sz, n) = (files.iter().map(|f| f.size).sum(), files.len() as u64);
         let max = b.dirs.iter().map(|d| d.0).max().unwrap_or(0) as usize;
         if max >= self.dirs.len() {
@@ -131,7 +129,7 @@ impl Tree {
         }
         let mut ids = Vec::with_capacity(b.dirs.len());
         for (cid, name) in b.dirs {
-            self.dirs[cid as usize] = Dir { name, parent: b.id, born: now, ..Default::default() };
+            self.dirs[cid as usize] = Dir { name, parent: b.id, ..Default::default() };
             ids.push(cid);
         }
         let d = &mut self.dirs[b.id as usize];
@@ -318,7 +316,7 @@ mod tests {
         let scan = start(root.clone(), 0, 1);
         let mut t = Tree::new(root.to_str().unwrap());
         while let Ok(Msg::Batch(b)) = scan.rx.recv() {
-            t.apply(b, 0.0);
+            t.apply(b);
         }
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(t.dirs[0].nfiles, 85 * 2);
@@ -329,9 +327,9 @@ mod tests {
     #[test]
     fn sizes_stay_consistent_through_delete_and_clear() {
         let mut t = Tree::new("R");
-        t.apply(Batch { id: 0, files: vec![("a".into(), 10), ("b".into(), 20)], dirs: vec![(1, "s".into()), (2, "u".into())] }, 0.0);
-        t.apply(Batch { id: 1, files: vec![("c".into(), 100), ("d".into(), 200)], dirs: vec![] }, 0.0);
-        t.apply(Batch { id: 2, files: vec![("e".into(), 1000)], dirs: vec![] }, 0.0);
+        t.apply(Batch { id: 0, files: vec![("a".into(), 10), ("b".into(), 20)], dirs: vec![(1, "s".into()), (2, "u".into())] });
+        t.apply(Batch { id: 1, files: vec![("c".into(), 100), ("d".into(), 200)], dirs: vec![] });
+        t.apply(Batch { id: 2, files: vec![("e".into(), 1000)], dirs: vec![] });
         let root = |t: &Tree| (t.dirs[0].size, t.dirs[0].nfiles);
         assert_eq!(root(&t), (1330, 5));
         t.remove(Item::File(1, 0));
@@ -340,7 +338,7 @@ mod tests {
         assert_eq!((root(&t), t.dirs[0].dirs.clone()), ((230, 3), vec![1]));
         t.clear_dir(1);
         assert_eq!((root(&t), t.dirs[1].size), ((30, 2), 0));
-        t.apply(Batch { id: 1, files: vec![("f".into(), 5)], dirs: vec![] }, 0.0); // its rescan
+        t.apply(Batch { id: 1, files: vec![("f".into(), 5)], dirs: vec![] }); // its rescan
         assert_eq!(root(&t), (35, 3));
     }
 

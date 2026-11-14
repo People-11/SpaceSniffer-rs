@@ -144,7 +144,7 @@ fn ease(k: f32) -> f32 {
 /// Must match COOL in shader.wgsl: progress span over which a flipped cell cools (and its label types).
 const WAVE_COOL: f32 = 0.3;
 
-/// CPU twin of `wave_e()` in the shader (labels use a per-label jitter instead of clump noise).
+/// CPU twin of `wave_e()` in the shader (labels use a per-label jitter instead of the Bayer band).
 struct Wave {
     origin: Pos2,
     maxd: f32,
@@ -367,8 +367,6 @@ pub struct App {
     /// Frame timestamps of the last second, and smoothed CPU time per frame (ms).
     frames: std::collections::VecDeque<Instant>,
     cpu_ms: f32,
-    /// When tiles were last discovered: their white-hot flash still cools for ~1s after.
-    born_t: f32,
 }
 
 impl App {
@@ -419,7 +417,6 @@ impl App {
             title: String::new(),
             frames: Default::default(),
             cpu_ms: 0.0,
-            born_t: 0.0,
         };
         if let Some(rs) = cc.wgpu_render_state.as_ref() {
             let i = rs.adapter.get_info();
@@ -500,7 +497,6 @@ impl App {
     }
 
     fn pump(&mut self) {
-        let now = self.now();
         let Some(scan) = &self.scan else { return };
         let Some(t) = self.tree.as_mut() else { return };
         let budget = Instant::now();
@@ -508,10 +504,7 @@ impl App {
         // Bounded so a burst of batches never stalls a frame.
         while budget.elapsed().as_millis() < 8 {
             match scan.rx.try_recv() {
-                Ok(tree::Msg::Batch(b)) => {
-                    t.apply(b, now);
-                    self.born_t = now;
-                }
+                Ok(tree::Msg::Batch(b)) => t.apply(b),
                 Ok(tree::Msg::Done) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     done = true;
                     break;
@@ -640,7 +633,7 @@ impl App {
             out.push(Inst {
                 rect: [p.pos.x - s, p.pos.y - s, p.pos.x + s, p.pos.y + s],
                 color: [p.col[0], p.col[1], p.col[2], k * k * 1.4],
-                p: [99.0, 0.0, gfx::PARTICLE, 3.0],
+                p: [0.0, 0.0, gfx::PARTICLE, 3.0],
                 q: [0.0; 4],
                 o: gfx::STATIC,
                 t: gfx::NO_TEXT,
@@ -757,7 +750,7 @@ impl App {
                         let block = |rect: Rect, inten: f32, head: f32| Inst {
                             rect: [rect.min.x, rect.min.y, rect.max.x, rect.max.y],
                             color: [FOLDER_RGB[0], FOLDER_RGB[1], FOLDER_RGB[2], inten],
-                            p: [99.0, 0.0, gfx::FIELD, 0.0],
+                            p: [0.0, 0.0, gfx::FIELD, 0.0],
                             q: [head, hov, 0.5, 0.0],
                             o: gfx::STATIC,
                             t: gfx::NO_TEXT,
@@ -996,21 +989,21 @@ impl App {
                 let at = |tiles: &[Tile]| -> At { tiles.iter().map(|x| (x.item, (x.rect, x.open))).collect() };
                 let (old_at, new_at) = (at(&a.old), at(&self.tiles));
                 let kept = |x: &Tile, other: &At| other.get(&x.item) == Some(&(x.rect, x.open));
-                self.layer(t, self.tiles.iter().filter(|x| kept(x, &old_at)), new_cam, 0.0, None, now, &mut insts, &mut labels);
-                self.layer(t, a.old.iter().filter(|x| !kept(x, &new_at)), old_cam, gfx::OUTGOING, a.anchor, now, &mut insts, &mut labels);
-                self.layer(t, self.tiles.iter().filter(|x| !kept(x, &old_at)), new_cam, gfx::INCOMING, a.anchor, now, &mut insts, &mut labels);
+                self.layer(t, self.tiles.iter().filter(|x| kept(x, &old_at)), new_cam, 0.0, None, &mut insts, &mut labels);
+                self.layer(t, a.old.iter().filter(|x| !kept(x, &new_at)), old_cam, gfx::OUTGOING, a.anchor, &mut insts, &mut labels);
+                self.layer(t, self.tiles.iter().filter(|x| !kept(x, &old_at)), new_cam, gfx::INCOMING, a.anchor, &mut insts, &mut labels);
             } else if matches!(a.kind, Kind::Out { .. }) {
                 // Zooming out the parent (new) surrounds the shrinking child (old): draw it first.
-                self.layer(t, &self.tiles, new_cam, gfx::INCOMING, a.anchor, now, &mut insts, &mut labels);
-                self.layer(t, &a.old, old_cam, gfx::OUTGOING, a.anchor, now, &mut insts, &mut labels);
+                self.layer(t, &self.tiles, new_cam, gfx::INCOMING, a.anchor, &mut insts, &mut labels);
+                self.layer(t, &a.old, old_cam, gfx::OUTGOING, a.anchor, &mut insts, &mut labels);
             } else {
-                self.layer(t, &a.old, old_cam, gfx::OUTGOING, a.anchor, now, &mut insts, &mut labels);
-                self.layer(t, &self.tiles, new_cam, gfx::INCOMING, a.anchor, now, &mut insts, &mut labels);
+                self.layer(t, &a.old, old_cam, gfx::OUTGOING, a.anchor, &mut insts, &mut labels);
+                self.layer(t, &self.tiles, new_cam, gfx::INCOMING, a.anchor, &mut insts, &mut labels);
             }
             wave = Some(w);
             self.cam = new_cam;
         } else {
-            self.layer(t, &self.tiles, (area, area), 0.0, None, now, &mut insts, &mut labels);
+            self.layer(t, &self.tiles, (area, area), 0.0, None, &mut insts, &mut labels);
             self.cam = (area, area);
         }
         let painter = ui.painter().with_clip_rect(area.expand(1.0).intersect(ui.clip_rect()));
@@ -1131,7 +1124,7 @@ impl App {
 
     /// Draw `tiles` under the camera map `cam` (layout rect -> screen rect) with a transition role.
     #[allow(clippy::too_many_arguments)]
-    fn layer<'a>(&self, t: &Tree, tiles: impl IntoIterator<Item = &'a Tile>, cam: (Rect, Rect), role: f32, anchor: Option<Item>, now: f32, insts: &mut Vec<Inst>, labels: &mut Vec<Label>) {
+    fn layer<'a>(&self, t: &Tree, tiles: impl IntoIterator<Item = &'a Tile>, cam: (Rect, Rect), role: f32, anchor: Option<Item>, insts: &mut Vec<Inst>, labels: &mut Vec<Label>) {
         let (from, to) = cam;
         let s = to.size() / from.size();
         let mode = if role == gfx::INCOMING {
@@ -1149,32 +1142,31 @@ impl App {
                 (true, _) => Some(LMode::Full),
                 (false, m) => Some(m),
             };
-            self.draw(t, tile, from, to, s, role, mode, now, insts, labels);
+            self.draw(t, tile, from, to, s, role, mode, insts, labels);
         }
     }
 
     /// One tile, camera-mapped. Label visibility is decided in layout space so the camera
     /// never makes labels pop. Tolerates stale items.
     #[allow(clippy::too_many_arguments)]
-    fn draw(&self, t: &Tree, tile: &Tile, from: Rect, to: Rect, s: Vec2, role: f32, mode: Option<LMode>, now: f32, insts: &mut Vec<Inst>, labels: &mut Vec<Label>) {
+    fn draw(&self, t: &Tree, tile: &Tile, from: Rect, to: Rect, s: Vec2, role: f32, mode: Option<LMode>, insts: &mut Vec<Inst>, labels: &mut Vec<Label>) {
         let map = |p: Pos2| to.min + (p - from.min) * s;
         let r = Rect::from_min_max(map(tile.rect.min), map(tile.rect.max));
         if r.width() <= 0.0 || r.height() <= 0.0 {
             return;
         }
         let item = tile.item;
-        let (is_dir, col, born, size, name) = match item {
+        let (is_dir, col, size, name) = match item {
             Item::Dir(d) => {
                 let Some(x) = t.dirs.get(d as usize) else { return };
-                (true, FOLDER_RGB, x.born, x.size, &*x.name)
+                (true, FOLDER_RGB, x.size, &*x.name)
             }
             Item::File(d, f) => {
                 let Some(x) = t.dirs.get(d as usize).and_then(|x| x.files.get(f as usize)) else { return };
-                (false, rgb(x.cat), x.born, x.size, &*x.name)
+                (false, rgb(x.cat), x.size, &*x.name)
             }
         };
         let dim = self.filter.active() && !is_dir && !self.filter.matches(name, size);
-        let age = now - born;
         let mut hov = self.hover_fx.iter().find(|x| x.0 == item).map_or(0.0, |x| x.1 * x.1 * (3.0 - 2.0 * x.1));
         // Inside a lit folder (its rect strictly contains ours): lit the same way.
         for &(g, v) in &self.group_lit {
@@ -1182,11 +1174,10 @@ impl App {
                 hov = hov.max(v);
             }
         }
-        let glow = if age < 0.8 && r.area() > 30.0 { 6.0 * (1.0 - age / 0.8) } else { 0.0 };
         insts.push(Inst {
             rect: [r.min.x, r.min.y, r.max.x, r.max.y],
             color: [col[0], col[1], col[2], if dim { DIM } else { 1.0 }],
-            p: [age, 0.0, gfx::FIELD, glow],
+            p: [0.0, 0.0, gfx::FIELD, 0.0],
             q: [if tile.open { self.header } else { 0.0 }, hov, tile.tone as f32 / (layout::TONES - 1) as f32, 0.0],
             o: [role, 0.0, 0.0, 0.0],
             t: gfx::NO_TEXT,
@@ -1369,7 +1360,7 @@ impl eframe::App for App {
         self.cpu_ms = self.cpu_ms * 0.9 + frame_t0.elapsed().as_secs_f32() * 1000.0 * 0.1;
         // The pixel field is static: keep drawing only while something moves (input repaints anyway).
         let easing = self.hover_fx.iter().chain(&self.group_fx).any(|x| x.1 < 1.0);
-        let busy = self.scan.is_some() || self.anim.is_some() || !self.particles.is_empty() || easing || self.now() - self.born_t < 1.2;
+        let busy = self.scan.is_some() || self.anim.is_some() || !self.particles.is_empty() || easing;
         if busy {
             if minimized {
                 ctx.request_repaint_after(std::time::Duration::from_millis(250)); // keep the scan flowing
@@ -1424,9 +1415,9 @@ mod tests {
         //   │   └ 4
         //   └ 2 ─ 5
         let mut t = Tree::new("R");
-        t.apply(tree::Batch { id: 0, files: vec![], dirs: vec![(1, "a".into()), (2, "b".into())] }, 0.0);
-        t.apply(tree::Batch { id: 1, files: vec![], dirs: vec![(3, "c".into()), (4, "d".into())] }, 0.0);
-        t.apply(tree::Batch { id: 2, files: vec![], dirs: vec![(5, "e".into())] }, 0.0);
+        t.apply(tree::Batch { id: 0, files: vec![], dirs: vec![(1, "a".into()), (2, "b".into())] });
+        t.apply(tree::Batch { id: 1, files: vec![], dirs: vec![(3, "c".into()), (4, "d".into())] });
+        t.apply(tree::Batch { id: 2, files: vec![], dirs: vec![(5, "e".into())] });
         let mut ex = HashSet::new();
         assert!(toggle(&t, &mut ex, 1, false));
         assert!(toggle(&t, &mut ex, 3, false));
