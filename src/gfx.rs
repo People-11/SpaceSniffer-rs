@@ -1,5 +1,9 @@
 //! Instanced wgpu renderer for the pixel-field tiles (treemap, drive picker) and particles,
 //! injected into egui's render pass via a paint callback.
+//!
+//! Every dot cell is one colour, so each draw is rendered at one texel per cell into its own
+//! texture first, then scaled up cell by cell onto the screen: at 4K the heavy shader runs on
+//! 1/9-1/16 of the pixels.
 
 use bytemuck::Zeroable;
 use eframe::egui;
@@ -37,7 +41,8 @@ struct Uniform {
     size: [f32; 2],
     ppp: f32,
     nw: f32,
-    _pad: [f32; 2],
+    /// First dot cell of the draw's texture (screen cells).
+    cell0: [f32; 2],
     waves: [Wave; MAX_WAVES],
 }
 
@@ -48,11 +53,16 @@ struct Slot {
     ibuf: wgpu::Buffer,
     cap: usize,
     count: u32,
+    /// The draw at one texel per dot cell, its size in cells, and its bind group for the blit.
+    tex: Option<(wgpu::TextureView, [u32; 2], wgpu::BindGroup)>,
 }
 
 struct Res {
     pipeline: wgpu::RenderPipeline,
+    blit: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
+    tbgl: wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
     slots: Vec<Slot>,
 }
 
@@ -68,7 +78,7 @@ fn slot(dev: &wgpu::Device, bgl: &wgpu::BindGroupLayout) -> Slot {
         entries: &[wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() }],
     });
     let cap = 1024;
-    Slot { ubuf, bind, ibuf: inst_buf(dev, cap), cap, count: 0 }
+    Slot { ubuf, bind, ibuf: inst_buf(dev, cap), cap, count: 0, tex: None }
 }
 
 pub fn init(rs: &RenderState) {
@@ -90,10 +100,48 @@ pub fn init(rs: &RenderState) {
             count: None,
         }],
     });
+    let tbgl = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        }],
+    });
     let layout = dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: None,
         bind_group_layouts: &[Some(&bgl)],
         immediate_size: 0,
+    });
+    let target = Some(wgpu::ColorTargetState {
+        format: rs.target_format,
+        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+        write_mask: wgpu::ColorWrites::ALL,
+    });
+    let blit = dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("blit"),
+        layout: Some(&dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&bgl), Some(&tbgl)],
+            immediate_size: 0,
+        })),
+        vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_blit"), compilation_options: Default::default(), buffers: &[] },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_blit"),
+            compilation_options: Default::default(),
+            targets: std::slice::from_ref(&target),
+        }),
+        primitive: Default::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
     });
     let pipeline = dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("pixel"),
@@ -112,11 +160,7 @@ pub fn init(rs: &RenderState) {
             module: &shader,
             entry_point: Some("fs"),
             compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: rs.target_format,
-                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
+            targets: &[target],
         }),
         primitive: Default::default(),
         depth_stencil: None,
@@ -124,7 +168,7 @@ pub fn init(rs: &RenderState) {
         multiview_mask: None,
         cache: None,
     });
-    rs.renderer.write().callback_resources.insert(Res { pipeline, bgl, slots: vec![] });
+    rs.renderer.write().callback_resources.insert(Res { pipeline, blit, bgl, tbgl, format: rs.target_format, slots: vec![] });
 }
 
 fn inst_buf(dev: &wgpu::Device, cap: usize) -> wgpu::Buffer {
@@ -150,7 +194,7 @@ impl CallbackTrait for Draw {
         dev: &wgpu::Device,
         queue: &wgpu::Queue,
         sd: &ScreenDescriptor,
-        _enc: &mut wgpu::CommandEncoder,
+        enc: &mut wgpu::CommandEncoder,
         res: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         let res: &mut Res = res.get_mut().unwrap();
@@ -158,31 +202,77 @@ impl CallbackTrait for Draw {
             res.slots.push(slot(dev, &res.bgl));
         }
         let r = &mut res.slots[self.slot];
+        r.count = self.insts.len() as u32;
+        if r.count == 0 {
+            return vec![];
+        }
         if self.insts.len() > r.cap {
             r.cap = self.insts.len().next_power_of_two();
             r.ibuf = inst_buf(dev, r.cap);
         }
         queue.write_buffer(&r.ibuf, 0, bytemuck::cast_slice(&self.insts));
+        // The dot cells the rect touches (cell size as in shader.wgsl).
+        let ppp = sd.pixels_per_point;
+        let cs = (2.0 * ppp).floor().max(2.0);
+        let c0 = (self.rect.min.to_vec2() * ppp / cs).floor();
+        let c1 = (self.rect.max.to_vec2() * ppp / cs).ceil();
+        let n = [(c1.x - c0.x).max(1.0) as u32, (c1.y - c0.y).max(1.0) as u32];
         let u = Uniform {
-            origin: self.rect.min.into(),
-            size: self.rect.size().into(),
-            ppp: sd.pixels_per_point,
+            origin: (c0 * cs / ppp).into(),
+            size: (egui::vec2(n[0] as f32, n[1] as f32) * cs / ppp).into(),
+            ppp,
             nw: self.nw as f32,
-            _pad: [0.0; 2],
+            cell0: c0.into(),
             waves: self.waves,
         };
         queue.write_buffer(&r.ubuf, 0, bytemuck::bytes_of(&u));
-        r.count = self.insts.len() as u32;
+        if r.tex.as_ref().is_none_or(|t| t.1 != n) {
+            let tex = dev.create_texture(&wgpu::TextureDescriptor {
+                label: Some("field"),
+                size: wgpu::Extent3d { width: n[0], height: n[1], depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: res.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&Default::default());
+            let bind = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &res.tbgl,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }],
+            });
+            r.tex = Some((view, n, bind));
+        }
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("field"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &r.tex.as_ref().unwrap().0,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&res.pipeline);
+        pass.set_bind_group(0, &r.bind, &[]);
+        pass.set_vertex_buffer(0, r.ibuf.slice(..));
+        pass.draw(0..6, 0..r.count);
         vec![]
     }
 
     fn paint(&self, _info: egui::PaintCallbackInfo, pass: &mut wgpu::RenderPass<'static>, res: &CallbackResources) {
         let res: &Res = res.get().unwrap();
         let Some(r) = res.slots.get(self.slot).filter(|r| r.count > 0) else { return };
-        pass.set_pipeline(&res.pipeline);
+        let Some((_, _, tex)) = &r.tex else { return };
+        pass.set_pipeline(&res.blit);
         pass.set_bind_group(0, &r.bind, &[]);
-        pass.set_vertex_buffer(0, r.ibuf.slice(..));
-        pass.draw(0..6, 0..r.count);
+        pass.set_bind_group(1, tex, &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 

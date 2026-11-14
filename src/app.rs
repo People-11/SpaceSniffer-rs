@@ -380,7 +380,7 @@ pub struct App {
     anim: Option<Anim>,
     /// Surface supports Mailbox: switch to it on the first frame and pace with DwmFlush.
     mailbox: bool,
-    mailbox_set: bool,
+    started: bool,
     gpu_info: String,
     hover: Option<Item>,
     menu_item: Option<Item>,
@@ -434,7 +434,7 @@ impl App {
             toggled: None,
             anim: None,
             mailbox: cc.wgpu_render_state.as_ref().is_some_and(|rs| supports_mailbox(cc, rs)),
-            mailbox_set: false,
+            started: false,
             gpu_info: String::new(),
             hover: None,
             menu_item: None,
@@ -1293,9 +1293,15 @@ fn setup_style(ctx: &egui::Context) {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        if self.mailbox && !self.mailbox_set {
-            self.mailbox_set = true;
-            frame.set_wgpu_surface_config(SurfaceConfig { present_mode: wgpu::PresentMode::Mailbox, desired_maximum_frame_latency: Some(1) });
+        if !self.started {
+            self.started = true;
+            // eframe keeps the window hidden until a frame is presented, and drops a frame whose
+            // surface is not ready yet (Occluded / Timeout, seen on 4K high refresh) without asking
+            // for another: show it ourselves so it can't stay hidden.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            if self.mailbox {
+                frame.set_wgpu_surface_config(SurfaceConfig { present_mode: wgpu::PresentMode::Mailbox, desired_maximum_frame_latency: Some(1) });
+            }
         }
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         // Fifo already blocks in present; DwmFlush there would only add a second wait.

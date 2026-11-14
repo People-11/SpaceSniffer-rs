@@ -12,7 +12,7 @@ struct U {
     size: vec2f,
     ppp: f32,
     nw: f32,      // number of waves (0: no transition)
-    _pad: vec2f,
+    cell0: vec2f, // first dot cell of the draw's texture (origin/size above cover its cells)
     // Per wave, 3 vec4s: origin.xy, max distance, progress K (0..1); region it acts on (min.xy,
     // max.xy); x = 1 if outside that region is new already (zoom out: the ring closes in).
     w: array<vec4f, 12>,
@@ -173,4 +173,21 @@ fn fs(v: V) -> @location(0) vec4f {
     let own = v.p.y < 0.5 && min(ts.x, ts.y) >= 3.0;
     if ((own && min(rd.x, rd.y) < 0.5) || body) { level = 0.0; }
     return vec4f(shade(col, level) * inten, 1.0);
+}
+
+// The draw rendered at one texel per dot cell (see gfx.rs), scaled up onto the screen: a triangle
+// covering the callback's viewport, each pixel taking its cell's texel.
+@group(1) @binding(0) var field: texture_2d<f32>;
+
+@vertex
+fn vs_blit(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+    let c = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4f(c * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs_blit(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+    let cs = max(2.0, floor(2.0 * u.ppp));
+    let c = vec2i(floor(pos.xy / cs) - u.cell0);
+    return textureLoad(field, clamp(c, vec2i(0), vec2i(textureDimensions(field)) - 1), 0);
 }
