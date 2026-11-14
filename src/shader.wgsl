@@ -22,7 +22,7 @@ struct Inst {
     @location(1) color: vec4f, // rgb, intensity
     @location(2) p: vec4f,     // age(s), unused, kind, glow radius(pt)
     @location(3) q: vec4f,     // header h(pt), hover, tone (0..1), unused
-    @location(4) o: vec4f,     // role: 0 static, 1 incoming, 2 outgoing; y: hover tone equalisation
+    @location(4) o: vec4f,     // role: 0 static, 1 incoming, 2 outgoing
     @location(5) t: vec4f,     // label box (min.xy, max.xy); empty = none
 };
 
@@ -145,9 +145,9 @@ fn fs(v: V) -> @location(0) vec4f {
 
     // Ordered dither: every dot takes one of 5 levels. A tile's value picks the mix of two adjacent
     // levels through a 4x4 Bayer matrix, so tones read as regular patterns instead of noise.
-    // Layout gives edge neighbours different tones; a directly hovered tile eases to one target.
+    // Layout gives edge neighbours different tones. Hovered tiles (and every block of a hovered
+    // title's folder) ease to the same top level.
     let tone = v.q.z;
-    let eq = v.o.y;
     let org = round(v.rect.xy * u.ppp / cs);
     let ts = max(round((v.rect.zw - v.rect.xy) * u.ppp / cs), vec2f(1.0));
     let rd = cell - org;
@@ -155,7 +155,7 @@ fn fs(v: V) -> @location(0) vec4f {
     // one, so no tile turns into a solid block; a slight top-left light varies the pattern.
     let g = 1.0 - (rd.x / ts.x + rd.y / ts.y) * 0.5;
     var n = 1.25 + 0.5 * round(tone * 3.0) + (g - 0.5) * 0.2;
-    n = mix(n, 3.5, eq) + 0.8 * max(hover - eq, 0.0);
+    n = mix(n, 3.9, hover);
     n *= 1.0 - 0.8 * quiet;
     // Directory header strip: sparse and dark under its title.
     if (v.pt.y < v.rect.y + v.q.x) { n = 0.4 + 0.6 * hover; }

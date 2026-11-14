@@ -924,9 +924,8 @@ impl App {
             Some(Item::Dir(d)) if d != 0 => Some(Item::Dir(t.dirs[d as usize].parent)),
             _ => None,
         };
-        // Targets: the hovered tile and that parent are lifted *and* eased to the top tone (so every
-        // hovered tile reaches the same brightness); a hovered title also lifts all the blocks
-        // inside its folder, keeping their tones so they stay distinguishable.
+        // Targets: the hovered tile and that parent go to the top level; a hovered title also lights
+        // all the blocks inside its folder the same way.
         let lit = [hover, parent];
         let group = hover.filter(|_| on_title);
         // Hover brightness eases in/out over HOVER_SECS; tiles just left keep a short afterglow.
@@ -1075,7 +1074,7 @@ impl App {
             };
             egui::Area::new(egui::Id::unique("tile_tip"))
                 .order(egui::Order::Tooltip)
-                .fixed_pos(at + vec2(14.0, 18.0))
+                .fixed_pos((at + vec2(14.0, 18.0)).round())
                 .interactable(false)
                 .show(ui.ctx(), |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
@@ -1176,9 +1175,8 @@ impl App {
         };
         let dim = self.filter.active() && !is_dir && !self.filter.matches(name, size);
         let age = now - born;
-        let eq = self.hover_fx.iter().find(|x| x.0 == item).map_or(0.0, |x| x.1 * x.1 * (3.0 - 2.0 * x.1));
-        let mut hov = eq;
-        // Inside a lit folder (its rect strictly contains ours): lifted, own tone kept.
+        let mut hov = self.hover_fx.iter().find(|x| x.0 == item).map_or(0.0, |x| x.1 * x.1 * (3.0 - 2.0 * x.1));
+        // Inside a lit folder (its rect strictly contains ours): lit the same way.
         for &(g, v) in &self.group_lit {
             if g != tile.rect && g.contains_rect(tile.rect) {
                 hov = hov.max(v);
@@ -1190,7 +1188,7 @@ impl App {
             color: [col[0], col[1], col[2], if dim { DIM } else { 1.0 }],
             p: [age, 0.0, gfx::FIELD, glow],
             q: [if tile.open { self.header } else { 0.0 }, hov, tile.tone as f32 / (layout::TONES - 1) as f32, 0.0],
-            o: [role, eq, 0.0, 0.0],
+            o: [role, 0.0, 0.0, 0.0],
             t: gfx::NO_TEXT,
         });
         let inst = insts.len() - 1;
