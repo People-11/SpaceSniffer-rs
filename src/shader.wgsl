@@ -1,4 +1,4 @@
-// One instance = one rounded rect. The fragment shader procedurally draws the dot-matrix
+// One instance = one rect. The fragment shader procedurally draws the dot-matrix
 // "pixel field" (5 levels, ordered dither); particles are single dots of it.
 //
 // Transitions are done by the dot matrix itself (no alpha cross-fades): a wave sweeps from the
@@ -14,7 +14,7 @@ struct U {
     nw: f32,      // number of waves (0: no transition)
     _pad: vec2f,
     // Per wave, 3 vec4s: origin.xy, max distance, progress K (0..1); region it acts on (min.xy,
-    // max.xy); x = 1 if outside that region is new already.
+    // max.xy); x = 1 if outside that region is new already (zoom out: the ring closes in).
     w: array<vec4f, 12>,
 };
 @group(0) @binding(0) var<uniform> u: U;
@@ -79,10 +79,10 @@ fn wave_e(i: u32, p: vec2f, cs: f32) -> f32 {
     let r = u.w[i * 3u + 1u];
     let x = u.w[i * 3u + 2u];
     if (any(p < r.xy) || any(p > r.zw)) { return select(-1.0, COOL, x.x > 0.5); }
-    // Where p lies along the front's path, 0..1 (Shape in app.rs): a ring spreading out from the
-    // origin, or (1) closing in on it from the corners.
+    // Where p lies along the front's path, 0..1 (Wave::dist in app.rs): a ring spreading out from
+    // the origin, or on a zoom out closing in on it from the corners.
     let d0 = clamp(length(p - w.xy) / max(w.z, 1.0), 0.0, 1.0);
-    let d = select(d0, 1.0 - d0, x.y > 0.5);
+    let d = select(d0, 1.0 - d0, x.x > 0.5);
     // The band fades in with distance so the click point itself reacts on the very first frame.
     let thr = d * 0.8 + bayer4(floor(p * u.ppp / cs)) * 0.2 * min(d * 4.0, 1.0);
     return w.w * (1.0 + COOL) - thr;
@@ -96,13 +96,16 @@ fn fs(v: V) -> @location(0) vec4f {
     let hover = v.q.y;
     let lo = u32(v.p.z);
     let hi = u32(v.p.w);
+    if (kind == 2u) { // particle: one dot, at its level
+        return vec4f(shade(col, inten), 1.0);
+    }
 
     // Dot lattice fixed to the screen, in physical pixels: like an LED matrix, the dots never
     // move or scale; zooming tiles slide their colours across it. Tiles at rest sit exactly on it.
     // ~2pt dot pitch (3px at 150% scaling), dots fill their cell with no gap.
     let cs = max(2.0, floor(2.0 * u.ppp)); // = layout::grid() * ppp
-    let gp = v.pt * u.ppp;
-    let cell = floor(gp / cs);
+    let cell = floor(v.pt * u.ppp / cs);
+    let cc = (cell + 0.5) * cs / u.ppp; // its centre, in points
     // Transition: each screen cell belongs to exactly one layer (every layer evaluates the same
     // cell centre), so they never overlap or leave a hole, even while the camera zooms.
     // Light of a wave front: rises on the layer it takes away just ahead of it, cools on the one it
@@ -110,11 +113,10 @@ fn fs(v: V) -> @location(0) vec4f {
     var born = 0.0;
     let nw = u32(u.nw);
     if (nw > 0u) {
-        let sc = (floor(v.pt * u.ppp / cs) + 0.5) * cs / u.ppp;
         var es = array<f32, 4>(-1.0, -1.0, -1.0, -1.0);
         var s = 0u; // layer shown here: the newest wave passed
         for (var i = 0u; i < nw; i++) {
-            es[i] = wave_e(i, sc, cs);
+            es[i] = wave_e(i, cc, cs);
             if (es[i] >= 0.0) { s = i + 1u; }
         }
         if (s < lo || s > hi) { discard; }
@@ -128,15 +130,10 @@ fn fs(v: V) -> @location(0) vec4f {
         }
     }
 
-    if (kind == 2u) { // particle: one dot, at its level
-        return vec4f(shade(col, inten), 1.0);
-    }
-
     // Quiet zone: the dots under a label and one dot around it turn into title strip dots (below),
     // so the text always sits on a dark patch; it fades with the label during transitions.
     var quiet = 0.0;
     if (v.t.z > v.t.x) {
-        let cc = (cell + 0.5) * cs / u.ppp;
         let out = max(v.t.xy - cc, cc - v.t.zw);
         quiet = select(0.0, v.q.w, max(out.x, out.y) < cs / u.ppp);
     }
@@ -173,7 +170,7 @@ fn fs(v: V) -> @location(0) vec4f {
     // block of small tiles (see layout.rs).
     let body = v.q.x > 0.0 && v.pt.y >= v.rect.y + v.q.x;
     // Tiles in a folder's block of small ones (p.y = 1) have none: the block has it.
-    let own = kind == 0u && v.p.y < 0.5 && min(ts.x, ts.y) >= 3.0;
+    let own = v.p.y < 0.5 && min(ts.x, ts.y) >= 3.0;
     if ((own && min(rd.x, rd.y) < 0.5) || body) { level = 0.0; }
     return vec4f(shade(col, level) * inten, 1.0);
 }

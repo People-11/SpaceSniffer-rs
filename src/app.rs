@@ -229,8 +229,7 @@ impl Anim {
     fn waves(&self, cams: &[Map], now: f32) -> Vec<Wave> {
         let w = |(s, &c): (&Step, &Map)| {
             let (origin, rect) = (apply(c, s.origin), apply_rect(c, s.rect));
-            let shape = if s.outside { Shape::Gather } else { Shape::Spread };
-            Wave { origin, maxd: far_corner(origin, rect), k: s.k(now).clamp(0.0, 1.0), rect, outside: s.outside, shape }
+            Wave { origin, maxd: far_corner(origin, rect), k: s.k(now).clamp(0.0, 1.0), rect, outside: s.outside }
         };
         self.steps.iter().zip(&cams[1..]).map(w).collect()
     }
@@ -263,25 +262,16 @@ struct Wave {
     maxd: f32,
     k: f32,
     rect: Rect,
+    /// Everything outside `rect` is new already (zoom out). Such a wave is a ring closing in on its
+    /// origin from the corners (the old view is drawn back in); the others spread out from it.
     outside: bool,
-    shape: Shape,
-}
-
-/// How a wave's front travels (must match `wave_e()` in shader.wgsl).
-#[derive(Clone, Copy, PartialEq)]
-enum Shape {
-    /// A ring spreading out from its origin (zoom in, expand / collapse, jumps).
-    Spread,
-    /// A ring closing in on its origin from the region's corners (zoom out: the old view is
-    /// drawn back in).
-    Gather,
 }
 
 impl Wave {
-    /// 0 at the start of the front's path, 1 where it ends.
+    /// 0 at the start of the front's path, 1 where it ends (must match `wave_e()` in shader.wgsl).
     fn dist(&self, p: Pos2) -> f32 {
         let d = ((p - self.origin).length() / self.maxd.max(1.0)).clamp(0.0, 1.0);
-        if self.shape == Shape::Gather { 1.0 - d } else { d }
+        if self.outside { 1.0 - d } else { d }
     }
 
     /// < 0: the front has not reached `p` yet; >= 0: flipped `e` progress units ago.
@@ -297,7 +287,7 @@ impl Wave {
 
     fn gpu(&self) -> gfx::Wave {
         let r = self.rect;
-        [[self.origin.x, self.origin.y, self.maxd, self.k], [r.min.x, r.min.y, r.max.x, r.max.y], [self.outside as u8 as f32, self.shape as u8 as f32, 0.0, 0.0]]
+        [[self.origin.x, self.origin.y, self.maxd, self.k], [r.min.x, r.min.y, r.max.x, r.max.y], [self.outside as u8 as f32, 0.0, 0.0, 0.0]]
     }
 }
 
@@ -1028,7 +1018,7 @@ impl App {
             let bx = Rect::from_center_size(l.pos, vec2(full.size().x.max(sub.size().x), full.size().y + sub.size().y));
             insts[l.inst].t = [bx.min.x, bx.min.y, bx.max.x, bx.max.y];
             insts[l.inst].q[3] = f_in * fade;
-            let (name, sub) = (wrapped(typed(&l.text)), p.layout_no_wrap(typed(&l.sub), font.clone(), white));
+            let (name, sub) = if f_in < 1.0 { (wrapped(typed(&l.text)), p.layout_no_wrap(typed(&l.sub), font.clone(), white)) } else { (full.clone(), sub) };
             let top = l.pos.y - (full.size().y + sub.size().y) * 0.5;
             for (g, y) in [(name, top), (sub, top + full.size().y)] {
                 p.galley(pos2(l.pos.x, y) - g.rect.center_top().to_vec2(), g, white);
@@ -1383,16 +1373,16 @@ mod tests {
     fn wave_and_typing() {
         let r = Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 100.0));
         let o = pos2(0.0, 0.0);
-        let w = |k| Wave { origin: o, maxd: far_corner(o, r), k, rect: r, outside: false, shape: Shape::Spread };
+        let w = |k| Wave { origin: o, maxd: far_corner(o, r), k, rect: r, outside: false };
         assert!(w(0.0).at(pos2(50.0, 50.0), 0.5) < 0.0);
         // Everything has flipped and fully cooled by the end, even the far corner.
         assert!(w(1.0).at(pos2(99.0, 99.0), 1.0) >= WAVE_COOL);
         assert!(w(0.0).at(pos2(0.0, 0.0), 0.0) >= 0.0, "the click point flips on the first frame");
         assert!(w(0.4).at(pos2(5.0, 5.0), 0.0) > w(0.4).at(pos2(90.0, 90.0), 0.0));
         assert!(w(0.9).at(pos2(150.0, 0.0), 0.0) < 0.0);
-        // A gathering front starts at the corners and ends at its origin.
+        // A zoom out's front starts at the corners and ends at its origin.
         let c = r.center();
-        let g = Wave { origin: c, maxd: far_corner(c, r), k: 0.0, rect: r, outside: false, shape: Shape::Gather };
+        let g = Wave { origin: c, maxd: far_corner(c, r), k: 0.0, rect: r, outside: true };
         assert!(g.dist(pos2(0.0, 0.0)) < 0.01 && g.dist(c) > 0.99);
         // Incoming (layer 1 of 2) types in as its cells cool.
         assert_eq!(typed("abcd", shown(&[0.0], 1, 1).0), "");
