@@ -455,6 +455,8 @@ struct Label {
     inst: usize,
 }
 
+type Drives = Vec<(String, Option<(u64, u64)>)>;
+
 pub struct App {
     tree: Option<Tree>,
     scan: Option<tree::Scan>,
@@ -503,7 +505,10 @@ pub struct App {
     rng: u64,
     t0: Instant,
     path_input: String,
-    drives: Vec<(String, Option<(u64, u64)>)>,
+    /// Drive roots with their (total, free) bytes, if read.
+    drives: Drives,
+    /// Their bytes, being read (see [`App::refresh_drives`]).
+    drives_rx: Option<std::sync::mpsc::Receiver<Drives>>,
     status: String,
     /// Frame timestamps of the last second, and smoothed CPU time per frame (ms).
     frames: std::collections::VecDeque<Instant>,
@@ -552,11 +557,13 @@ impl App {
             rng: 0x2545f4914f6cdd1d,
             t0: now,
             path_input: String::new(),
-            drives: win::drives(),
+            drives: vec![],
+            drives_rx: None,
             status: "Ready".into(),
             frames: Default::default(),
             cpu_ms: 0.0,
         };
+        app.refresh_drives(&cc.egui_ctx);
         if let Some(rs) = cc.wgpu_render_state.as_ref() {
             app.gpu_info = rs.adapter.get_info().name;
         }
@@ -564,6 +571,23 @@ impl App {
             app.start(&p);
         }
         app
+    }
+
+    /// List the drives now, their space once read: a slow or offline network drive can take
+    /// seconds to answer, which on the UI thread kept the window from showing.
+    fn refresh_drives(&mut self, ctx: &egui::Context) {
+        let roots = win::drives();
+        self.drives = roots.iter().map(|d| (d.clone(), self.drives.iter().find(|o| o.0 == *d).and_then(|o| o.1))).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(roots.into_iter().map(|d| {
+                let space = win::disk_space(std::path::Path::new(&d));
+                (d, space)
+            }).collect());
+            ctx.request_repaint();
+        });
+        self.drives_rx = Some(rx);
     }
 
     fn rand(&mut self) -> f32 {
@@ -798,7 +822,7 @@ impl App {
             if tool(ui, "\u{E838}", "Choose your space", !self.leaving, false) {
                 self.scan = None;
                 self.status = "Ready".into();
-                self.drives = win::drives();
+                self.refresh_drives(ui.ctx());
                 // Zoom back out to it (the tree goes once that is done); nothing else acts meanwhile.
                 self.leaving = self.tree.is_some();
                 self.back.clear();
@@ -873,6 +897,9 @@ impl App {
             }
             None => ui,
         };
+        if let Some(d) = self.drives_rx.as_ref().and_then(|r| r.try_recv().ok()) {
+            (self.drives, self.drives_rx) = (d, None);
+        }
         let mut go = None;
         let (mut insts, mut titles, mut blocks, mut picked, mut start_at) = (vec![], vec![], vec![], None, Pos2::ZERO);
         let pitch = layout::grid(ui.ctx().pixels_per_point());
@@ -1483,10 +1510,6 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         if !self.started {
             self.started = true;
-            // eframe keeps the window hidden until a frame is presented, and drops a frame whose
-            // surface is not ready yet (Occluded / Timeout, seen on 4K high refresh) without asking
-            // for another: show it ourselves so it can't stay hidden.
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             if self.mailbox {
                 frame.set_wgpu_surface_config(SurfaceConfig { present_mode: wgpu::PresentMode::Mailbox, desired_maximum_frame_latency: Some(1) });
             }
