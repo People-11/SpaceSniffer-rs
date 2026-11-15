@@ -6,13 +6,15 @@ on:
     tags: ["v*"]
   pull_request:
 
+permissions:
+  actions: write # delete old workflow runs
+
 jobs:
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
       - run: cargo test --release
       - run: cargo build --release
       - uses: actions/upload-artifact@v4
@@ -23,3 +25,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: target/release/spacesniffer-rs.exe
+      # keep only the latest 5 runs; runs even when the build fails
+      - name: Prune Old Actions
+        if: always()
+        uses: yanovian/prune-old-actions@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          days-ago: 0
+          keep-latest: 5
