@@ -211,9 +211,10 @@ struct Chooser {
     /// The picked drive's block (None: a typed path, no zoom), and where the wave starts.
     block: Option<Rect>,
     click: Pos2,
-    /// Its camera (layout -> screen) and card opacity when the drive was picked: picked mid-way
-    /// through a zoom back to it, the zoom into the drive starts from there. None: at rest.
-    cam: Option<Map>,
+    /// Its camera (layout -> screen, see [`Anim::motion`]) and card opacity when the drive was
+    /// picked: picked mid-way through a zoom back to it, the zoom into the drive takes over from
+    /// there. None: at rest.
+    cam: Option<[Map; 2]>,
     card: f32,
 }
 
@@ -231,9 +232,22 @@ fn index(tiles: &[Tile]) -> At {
 }
 
 impl Step {
-    fn k(&self, now: f32) -> f32 {
-        (now - self.t0) / if self.local { LOCAL_SECS } else { ZOOM_SECS }
+    fn secs(&self) -> f32 {
+        if self.local { LOCAL_SECS } else { ZOOM_SECS }
     }
+
+    fn k(&self, now: f32) -> f32 {
+        (now - self.t0) / self.secs()
+    }
+}
+
+/// A view (layout rect on screen) as centre and log size: zooms move it at an even pace.
+fn params(v: Rect) -> [f32; 4] {
+    [v.center().x, v.center().y, v.width().ln(), v.height().ln()]
+}
+
+fn from_params(p: [f32; 4]) -> Rect {
+    Rect::from_center_size(pos2(p[0], p[1]), vec2(p[2].exp(), p[3].exp()))
 }
 
 /// Transitions never reset or skip: one started mid-way stacks on top. Layer j is `steps[j].old`,
@@ -242,17 +256,29 @@ impl Step {
 /// the top layout to rest; the layers under it follow through each step's `rel`.
 struct Anim {
     steps: Vec<Step>,
-    /// Top layout's view when the newest step began (see [`top_cam`]).
+    /// Where the newest step's own path starts (see [`top_cam`]): the top layout's view when it
+    /// began, carried on by `coast`.
     v0: Rect,
+    /// An interrupted motion first comes to a stop like every zoom does (the [`ease`] tail, over
+    /// HOVER_SECS), from the velocity it had: this far on (in [`params`]) from where it was. Zero
+    /// when it began at rest.
+    coast: [f32; 4],
 }
+
+/// Time step over which a camera's velocity is measured.
+const DT: f32 = 1.0 / 240.0;
 
 impl Anim {
     /// Stack `step` on the running transition (or start one), its layout taking over from what is
-    /// on screen now: `cam`, the camera of the layout under it. Past MAX_WAVES the oldest layer
-    /// flips at once.
-    fn push(anim: &mut Option<Anim>, cam: Map, area: Rect, step: Step) {
-        let a = anim.get_or_insert_with(|| Anim { steps: vec![], v0: area });
-        a.v0 = view_after(cam, step.rel, area);
+    /// on screen: `from`, the camera of the layout under it now and DT before (see [`Anim::motion`]).
+    /// Past MAX_WAVES the oldest layer flips at once.
+    fn push(anim: &mut Option<Anim>, from: [Map; 2], area: Rect, step: Step) {
+        let (p, q) = (params(view_after(from[0], step.rel, area)), params(view_after(from[1], step.rel, area)));
+        // Stopping from velocity v along `ease` (whose slope starts at 3) over HOVER_SECS goes v * HOVER_SECS / 3.
+        let coast = std::array::from_fn(|i| (p[i] - q[i]) / DT * HOVER_SECS / 3.0);
+        let v0 = from_params(std::array::from_fn(|i| p[i] + coast[i]));
+        let a = anim.get_or_insert_with(|| Anim { steps: vec![], v0, coast });
+        (a.v0, a.coast) = (v0, coast);
         a.steps.push(step);
         if a.steps.len() > gfx::MAX_WAVES {
             a.steps.remove(0); // shortcut: the oldest layer flips at once; needs 5 clicks inside one transition
@@ -264,9 +290,26 @@ impl Anim {
         anim.as_ref().map_or((area, area), |a| *a.cams(area, now).last().unwrap())
     }
 
+    /// The top layout's camera now and DT before: what a new step takes over from, and how fast
+    /// that is moving.
+    fn motion(anim: &Option<Anim>, area: Rect, now: f32) -> [Map; 2] {
+        [Anim::cam_now(anim, area, now), Anim::cam_now(anim, area, now - DT)]
+    }
+
     /// Camera (layout -> screen) of every layer, bottom first.
     fn cams(&self, area: Rect, now: f32) -> Vec<Map> {
-        let mut c = top_cam(self.v0, area, ease(self.steps.last().map_or(1.0, |s| s.k(now))));
+        let mut c = top_cam(self.v0, area, 1.0);
+        if let Some(s) = self.steps.last() {
+            // Coast to a stop, then the step's own path in the time left.
+            let d = if self.coast == [0.0; 4] { 0.0 } else { HOVER_SECS };
+            let t = now - s.t0;
+            c = if t < d {
+                let p = params(self.v0);
+                (from_params(std::array::from_fn(|i| p[i] - self.coast[i] * (1.0 - ease(t / d)))), area)
+            } else {
+                top_cam(self.v0, area, ease((t - d) / (s.secs() - d)))
+            };
+        }
         let mut cams = vec![c];
         for s in self.steps.iter().rev() {
             c = then(s.rel, c);
@@ -1044,7 +1087,8 @@ impl App {
         let card = self.card(now);
         let top = self.chooser(ui, Some(card));
         // The chooser's camera now (the top layer's), or of whatever transition this leaves from.
-        let cam = Anim::cam_now(&self.anim, area, now);
+        let from = Anim::motion(&self.anim, area, now);
+        let cam = from[0];
         // Its widgets sit where it will come to rest: hit-test a click through where it is now.
         if self.left
             && let Some(click) = ui.input(|i| i.pointer.primary_clicked().then(|| i.pointer.interact_pos()).flatten()).filter(|&at| area.contains(at)).map(|at| apply(inverse(cam), at))
@@ -1054,7 +1098,7 @@ impl App {
             self.start(&drive);
             if !self.leaving {
                 // Started (a fresh tree): zoom into the drive from here.
-                self.enter(Chooser { block: Some(top.blocks[i]), click, cam: Some(cam), card, ..top }, area);
+                self.enter(Chooser { block: Some(top.blocks[i]), click, cam: Some(from), card, ..top }, area);
                 return false;
             }
         }
@@ -1071,7 +1115,7 @@ impl App {
                 None => ((area, area), area.center(), area, false),
             };
             let lit = self.lit.clone();
-            Anim::push(&mut self.anim, cam, area, Step { old, rel, local: false, anchor: None, t0: now, origin, rect, outside, at: None, chooser: None, lit });
+            Anim::push(&mut self.anim, from, area, Step { old, rel, local: false, anchor: None, t0: now, origin, rect, outside, at: None, chooser: None, lit });
         }
         let a = self.anim.as_ref().unwrap();
         let cams = a.cams(area, now);
@@ -1085,9 +1129,10 @@ impl App {
     /// Zoom out of chooser `c` into the scan just started from it, over `area` (the treemap's).
     fn enter(&mut self, c: Chooser, area: Rect) {
         let rel = (c.block.unwrap_or(area), area);
-        let (origin, cam) = (apply(rel, c.click), c.cam.unwrap_or((area, area)));
-        let step = Step { old: vec![], rel, local: false, anchor: None, t0: self.now(), origin, rect: area, outside: false, at: None, chooser: Some(c), lit: Lit::default() };
-        Anim::push(&mut self.anim, cam, area, step);
+        let (origin, from) = (apply(rel, c.click), c.cam.unwrap_or([(area, area); 2]));
+        let now = self.now();
+        let step = Step { old: vec![], rel, local: false, anchor: None, t0: now, origin, rect: area, outside: false, at: None, chooser: Some(c), lit: Lit::default() };
+        Anim::push(&mut self.anim, from, area, step);
     }
 
     /// Opacity of the chooser's card (heading, path row) during a zoom out of it (it fades away
@@ -1197,7 +1242,8 @@ impl App {
                     let (from, to) = (prev.0, self.view);
                     // The old layout's camera right now (mid-transition it is still moving), and the
                     // click in that layout's coords.
-                    let cam = Anim::cam_now(&self.anim, area, now);
+                    let motion = Anim::motion(&self.anim, area, now);
+                    let cam = motion[0];
                     let click = self.click_pos.take().map(|p| apply(inverse(cam), p));
                     let toggled = self.toggled.take();
                     let whole = (area, area);
@@ -1222,7 +1268,7 @@ impl App {
                     };
                     let local = from == to;
                     let at = (local || self.anim.as_ref().and_then(|a| a.steps.last()).is_some_and(|s| s.local)).then(|| index(&old));
-                    Anim::push(&mut self.anim, cam, area, Step { old, rel, local, anchor, t0: now, origin, rect, outside, at, chooser: None, lit });
+                    Anim::push(&mut self.anim, motion, area, Step { old, rel, local, anchor, t0: now, origin, rect, outside, at, chooser: None, lit });
                 } else if structural && prev.0 != u32::MAX {
                     // (A first layout keeps its transition: the zoom out of the chooser, see `enter`.)
                     self.anim = None;
@@ -1708,6 +1754,38 @@ mod tests {
         assert!(close(apply_rect(then(rel_in, top_cam(v2, area, 0.0)), tile), apply_rect(mid, tile)));
         let end = top_cam(v2, area, 1.0);
         assert!(close(end.0, area) && close(end.1, area));
+    }
+
+    /// A zoom interrupted by one the other way: the view keeps its velocity at the switch, comes
+    /// to a stop the way every zoom ends, turns, and still comes to rest exactly.
+    #[test]
+    fn interrupted_zoom_keeps_its_velocity() {
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let small = Rect::from_min_size(pos2(500.0, 100.0), vec2(200.0, 100.0));
+        let step = |rel: Map, t0: f32| Step { old: vec![], rel, local: false, anchor: None, t0, origin: Pos2::ZERO, rect: area, outside: false, at: None, chooser: None, lit: Lit::default() };
+        let mut anim = None;
+        Anim::push(&mut anim, [(area, area); 2], area, step((small, area), 0.0));
+        assert_eq!(anim.as_ref().unwrap().coast, [0.0; 4], "from rest: no coast");
+        let (t, h) = (0.2, 1e-3);
+        let rel = (area, small);
+        // View of the parent (the new top layout) under the zoom in, just before the switch.
+        let before = |t| params(view_after(Anim::cam_now(&anim, area, t), rel, area));
+        let (v1, v0) = (before(t), before(t - h));
+        let from = Anim::motion(&anim, area, t);
+        Anim::push(&mut anim, from, area, step(rel, t));
+        let after = |t| params(apply_rect(inverse(Anim::cam_now(&anim, area, t)), area));
+        let v2 = after(t + h);
+        for i in 0..4 {
+            let (a, b) = ((v1[i] - v0[i]) / h, (v2[i] - v1[i]) / h);
+            assert!((a - b).abs() <= 0.05 * a.abs().max(1.0), "param {i}: {a} -> {b}");
+            assert!((after(t)[i] - v1[i]).abs() < 1e-3, "no jump");
+            // Still for a moment where the coast ends, before the zoom back sets off.
+            let (c0, c1) = (after(t + HOVER_SECS - h), after(t + HOVER_SECS));
+            assert!((c1[i] - c0[i]).abs() / h <= 0.05 * a.abs().max(1.0), "param {i} stops");
+        }
+        let end = Anim::cam_now(&anim, area, t + ZOOM_SECS);
+        let r = apply_rect(end, area);
+        assert!((r.min - area.min).length() + (r.max - area.max).length() < 1e-2, "ends at rest: {end:?}");
     }
 
     /// Root (1) > mid (2) > inner (3) title strips: whichever way and however fast the pointer
