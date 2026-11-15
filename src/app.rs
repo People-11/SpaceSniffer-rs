@@ -455,7 +455,8 @@ struct Label {
     inst: usize,
 }
 
-type Drives = Vec<(String, Option<(u64, u64)>)>;
+/// A drive root with its (total, free) bytes, if read.
+type Drive = (String, Option<(u64, u64)>);
 
 pub struct App {
     tree: Option<Tree>,
@@ -506,9 +507,9 @@ pub struct App {
     t0: Instant,
     path_input: String,
     /// Drive roots with their (total, free) bytes, if read.
-    drives: Drives,
-    /// Their bytes, being read (see [`App::refresh_drives`]).
-    drives_rx: Option<std::sync::mpsc::Receiver<Drives>>,
+    drives: Vec<Drive>,
+    /// Their bytes as each is read (see [`App::refresh_drives`]).
+    drives_rx: Option<std::sync::mpsc::Receiver<Drive>>,
     status: String,
     /// Frame timestamps of the last second, and smoothed CPU time per frame (ms).
     frames: std::collections::VecDeque<Instant>,
@@ -579,14 +580,15 @@ impl App {
         let roots = win::drives();
         self.drives = roots.iter().map(|d| (d.clone(), self.drives.iter().find(|o| o.0 == *d).and_then(|o| o.1))).collect();
         let (tx, rx) = std::sync::mpsc::channel();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(roots.into_iter().map(|d| {
+        // One thread per drive: one that never answers holds up only itself.
+        for d in roots {
+            let (tx, ctx) = (tx.clone(), ctx.clone());
+            std::thread::spawn(move || {
                 let space = win::disk_space(std::path::Path::new(&d));
-                (d, space)
-            }).collect());
-            ctx.request_repaint();
-        });
+                let _ = tx.send((d, space));
+                ctx.request_repaint();
+            });
+        }
         self.drives_rx = Some(rx);
     }
 
@@ -897,8 +899,10 @@ impl App {
             }
             None => ui,
         };
-        if let Some(d) = self.drives_rx.as_ref().and_then(|r| r.try_recv().ok()) {
-            (self.drives, self.drives_rx) = (d, None);
+        while let Some((d, space)) = self.drives_rx.as_ref().and_then(|r| r.try_recv().ok()) {
+            if let Some(e) = self.drives.iter_mut().find(|e| e.0 == d) {
+                e.1 = space;
+            }
         }
         let mut go = None;
         let (mut insts, mut titles, mut blocks, mut picked, mut start_at) = (vec![], vec![], vec![], None, Pos2::ZERO);
