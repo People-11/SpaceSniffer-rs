@@ -5,6 +5,7 @@ use std::os::windows::process::CommandExt;
 use std::path::Path;
 use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetLogicalDrives};
+use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
 use windows_sys::Win32::UI::Shell::{
     FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_WANTNUKEWARNING, SHFILEOPSTRUCTW, SHFileOperationW, ShellExecuteW,
 };
@@ -12,6 +13,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MessageBoxW, SW_
 
 fn wide(s: &Path) -> Vec<u16> {
     s.as_os_str().encode_wide().chain([0, 0]).collect() // double NUL: SHFileOperation list format
+}
+
+/// Run the calling thread below normal priority: a scan's burst yields to the UI and other apps.
+pub fn below_normal() {
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
 }
 
 /// Block until the next DWM composition: frame pacing without GPU busy-wait.

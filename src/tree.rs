@@ -251,11 +251,15 @@ pub fn start(root: PathBuf, id: u32, next: u32) -> Scan {
         // Work stack of dirs still to list + count of dirs being listed right now.
         let work = Mutex::new((vec![(id, root)], 0usize));
         let cv = Condvar::new();
-        // Directory listing is IO-latency bound: oversubscribe the cores.
-        let threads = std::thread::available_parallelism().map_or(8, |n| n.get() * 2).max(8);
+        // Beyond about half the cores the threads only contend on file system locks: same speed
+        // (warm cache, C:\ on 20 cores), several times the CPU.
+        let threads = std::thread::available_parallelism().map_or(8, |n| n.get() / 2).clamp(4, 16);
         std::thread::scope(|s| {
             for _ in 0..threads {
-                s.spawn(|| worker(&work, &cv, &tx, &next, &c));
+                s.spawn(|| {
+                    crate::win::below_normal();
+                    worker(&work, &cv, &tx, &next, &c)
+                });
             }
         });
         let _ = tx.send(Msg::Done);
