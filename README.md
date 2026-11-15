@@ -1,8 +1,6 @@
 # SpaceSniffer-rs
 
-用 Rust 重写的 [SpaceSniffer](http://www.uderzo.it/main_products/space_sniffer/)：高性能并行扫描 + GPU 像素化 treemap + 单个 exe。
-
-![UI](SpaceSniffer-UI2.png)
+极致流畅的 [SpaceSniffer](http://www.uderzo.it/main_products/space_sniffer/) 继任者：Rust 编写，并行扫描，GPU 渲染的像素化 treemap，缩放与像素波过渡全程丝滑，单个 exe 即开即用。
 
 ## 功能
 
