@@ -183,7 +183,31 @@ struct Step {
     /// `old` by item, when an expand/collapse on either side of it needs to find its unchanged
     /// tiles (`old` never changes, so this is built once).
     at: Option<At>,
+    /// The drive chooser, when that is what this step leaves (`old` is empty then).
+    chooser: Option<Chooser>,
 }
+
+/// The drive chooser as a layer of a transition: the bottom one of the zoom into a scan (as it was
+/// when the drive was picked), the top one of the zoom out of it back to the chooser. Screen coords
+/// are its layout coords.
+#[derive(Clone)]
+struct Chooser {
+    /// Drive blocks, and their title strips with the text in them.
+    insts: Vec<Inst>,
+    titles: Vec<(Rect, String)>,
+    /// Each drive's block (as in `App::drives`).
+    blocks: Vec<Rect>,
+    /// The picked drive's block (None: a typed path, no zoom), and where the wave starts.
+    block: Option<Rect>,
+    click: Pos2,
+    /// Its camera (layout -> screen) and card opacity when the drive was picked: picked mid-way
+    /// through a zoom back to it, the zoom into the drive starts from there. None: at rest.
+    cam: Option<Map>,
+    card: f32,
+}
+
+/// Part of a zoom out of (into) the chooser over which its card (heading, path row) fades away (in).
+const CARD_FADE: f32 = 0.3;
 
 /// What a layout depends on: (view, area, tree version, expand version).
 type LayoutKey = (u32, Rect, u64, u64);
@@ -325,6 +349,77 @@ fn shown(es: &[f32], lo: usize, hi: usize, fixed: bool) -> (f32, f32) {
     (typed, fade)
 }
 
+/// Paint a layer stack's pixel field (`insts`, filling `area`) under its labels, each shown as far
+/// as the `waves` let it.
+fn paint_field(ui: &egui::Ui, area: Rect, mut insts: Vec<Inst>, labels: Vec<Label>, waves: &[Wave]) {
+    let _s = perf::span("labels");
+    let mut boxes = vec![];
+    let painter = ui.painter().with_clip_rect(area.expand(1.0).intersect(ui.clip_rect()));
+    // The pixel layer goes under the labels, but its quiet zones are only known once the labels
+    // are laid out: reserve its place in the paint order now, fill it in after.
+    let field = painter.add(egui::Shape::Noop);
+    for l in labels {
+        let jitter = ((l.pos.x * 12.9898 + l.pos.y * 78.233).sin() * 43758.547).fract().abs();
+        let es: Vec<f32> = waves.iter().map(|w| w.at(l.pos, jitter)).collect();
+        // Outgoing labels fade as a whole, incoming ones type in; the dark patch under a file
+        // label follows the same amount, so it never outstays (or precedes) its text.
+        let (f_in, fade) = shown(&es, l.lo, l.hi, l.fixed);
+        if f_in * fade <= 0.0 {
+            continue;
+        }
+        let typed = |s: &str| typed(s, f_in);
+        // Static labels always fit their tile, so they share the treemap's clip and egui draws all
+        // text in one batch; only mid-transition (tiles resizing under them) are they clipped
+        // per tile. No shadow: labels sit on a dark title strip or a dimmed quiet zone.
+        let p = if !waves.is_empty() { painter.with_clip_rect(l.clip.intersect(painter.clip_rect())) } else { painter.clone() };
+        let font = FontId::proportional(l.size);
+        let white = Color32::from_white_alpha((0.92 * fade * 255.0) as u8);
+        if l.sub.is_empty() {
+            // Title strip: "name - size", elided at the end when too wide.
+            let mut job = egui::text::LayoutJob::simple_singleline(typed(&l.text), font, white);
+            job.wrap.max_width = l.clip.max.x - l.pos.x;
+            job.wrap.max_rows = 1;
+            job.wrap.break_anywhere = true;
+            let g = p.layout_job(job);
+            p.galley(l.pos - vec2(0.0, g.size().y * 0.5), g, white);
+            continue;
+        }
+        // File: name wrapped to at most 2 lines, size below; if that doesn't fit, no label at all.
+        let wrapped = |s: String| {
+            let mut job = egui::text::LayoutJob::simple(s, font.clone(), white, l.room.x);
+            job.wrap.max_rows = 2;
+            job.wrap.break_anywhere = true;
+            job.halign = egui::Align::Center;
+            p.layout_job(job)
+        };
+        let (full, sub) = (wrapped(l.text.clone()), p.layout_no_wrap(l.sub.clone(), font.clone(), white));
+        if full.elided || sub.size().x > l.room.x || full.size().y + sub.size().y > l.room.y {
+            continue;
+        }
+        let bx = Rect::from_center_size(l.pos, vec2(full.size().x.max(sub.size().x), full.size().y + sub.size().y));
+        if boxes.len() == gfx::NO_LABEL as usize {
+            continue; // shortcut: no dark patch left for it, so no text; only ever this many fit on screen
+        }
+        insts[l.inst].p[1] = boxes.len() as u8;
+        insts[l.inst].q[2] = gfx::unorm(f_in * fade);
+        boxes.push([bx.min.x, bx.min.y, bx.max.x, bx.max.y]);
+        let (name, sub) = if f_in < 1.0 { (wrapped(typed(&l.text)), p.layout_no_wrap(typed(&l.sub), font.clone(), white)) } else { (full.clone(), sub) };
+        let top = l.pos.y - (full.size().y + sub.size().y) * 0.5;
+        for (g, y) in [(name, top), (sub, top + full.size().y)] {
+            p.galley(pos2(l.pos.x, y) - g.rect.center_top().to_vec2(), g, white);
+        }
+    }
+    painter.set(field, gfx::shape(area, insts, boxes, 1, &waves.iter().map(Wave::gpu).collect::<Vec<_>>()));
+}
+
+/// The treemap's rect in `room`: on the dot lattice, shifted by whole dots so what is lit sits
+/// centred across (its left column is gutter, dark; its right edge is not).
+fn field_rect(room: Rect, pitch: f32) -> Rect {
+    let area = layout::snap(room, pitch);
+    let off = ((area.min.x + pitch - room.min.x) - (room.max.x - area.max.x)) * 0.5;
+    area.translate(vec2(-(off / pitch).round() * pitch, 0.0))
+}
+
 /// The first `f` (0..1) of `text`, for typing in.
 fn typed(text: &str, f: f32) -> String {
     let n = text.chars().count();
@@ -378,6 +473,11 @@ pub struct App {
     /// Dir whose expand/collapse produced the pending relayout.
     toggled: Option<u32>,
     anim: Option<Anim>,
+    /// A drive was just picked: the chooser to zoom out of once the scan's first layout is in.
+    enter: Option<Chooser>,
+    /// Going back to the chooser (see `App::leave`); `left`: its zoom has started.
+    leaving: bool,
+    left: bool,
     /// Surface supports Mailbox: switch to it on the first frame and pace with DwmFlush.
     mailbox: bool,
     started: bool,
@@ -432,6 +532,9 @@ impl App {
             click_pos: None,
             toggled: None,
             anim: None,
+            enter: None,
+            leaving: false,
+            left: false,
             mailbox: cc.wgpu_render_state.as_ref().is_some_and(|rs| supports_mailbox(cc, rs)),
             started: false,
             gpu_info: String::new(),
@@ -507,6 +610,8 @@ impl App {
         self.built.clear(); // a new tree's versions start over: its keys could match old layouts
         self.expanded.clear();
         self.anim = None;
+        self.leaving = false;
+        self.left = false;
     }
 
     /// Rescan only the current view (SpaceSniffer "refresh").
@@ -680,7 +785,7 @@ impl App {
     // ---------------------------------------------------------------- UI pieces
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        let has_tree = self.tree.is_some();
+        let has_tree = self.tree.is_some() && !self.leaving;
         // Shortcuts go through their button, so they share its enabled state.
         let typing = ui.ctx().egui_wants_keyboard_input();
         let (mouse4, mouse5, bksp, f5) = ui.input(|i| {
@@ -690,11 +795,17 @@ impl App {
         let mut nav = None;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            if tool(ui, "\u{E838}", "Choose your space", true, false) {
-                self.tree = None;
+            if tool(ui, "\u{E838}", "Choose your space", !self.leaving, false) {
                 self.scan = None;
                 self.status = "Ready".into();
                 self.drives = win::drives();
+                // Zoom back out to it (the tree goes once that is done); nothing else acts meanwhile.
+                self.leaving = self.tree.is_some();
+                self.back.clear();
+                self.fwd.clear();
+                self.menu_item = None;
+                self.confirm = None;
+                self.particles.clear();
             }
             ui.separator();
             if tool(ui, "\u{E72B}", "Back (Mouse 4)", !self.back.is_empty(), mouse4) {
@@ -750,8 +861,20 @@ impl App {
         }
     }
 
-    fn chooser(&mut self, ui: &mut egui::Ui) {
+    /// `ghost`: drawn over whatever else `ui` holds, at this opacity, during a zoom out of (into)
+    /// it (see [`Chooser`]): its card only, no drives, no input.
+    fn chooser(&mut self, ui: &mut egui::Ui, ghost: Option<f32>) -> Chooser {
+        let mut child;
+        let ui = match ghost {
+            Some(a) => {
+                child = ui.new_child(egui::UiBuilder::new().max_rect(ui.max_rect()));
+                child.multiply_opacity(a);
+                &mut child
+            }
+            None => ui,
+        };
         let mut go = None;
+        let (mut insts, mut titles, mut blocks, mut picked, mut start_at) = (vec![], vec![], vec![], None, Pos2::ZERO);
         let pitch = layout::grid(ui.ctx().pixels_per_point());
         let header = layout::header(pitch);
         ui.vertical_centered(|ui| {
@@ -765,7 +888,6 @@ impl App {
                 let gap = (6.0 / pitch).round() * pitch;
                 let cols = self.drives.len().clamp(1, 3) as f32;
                 let size = vec2(((ui.available_width() - (cols - 1.0) * gap) / cols / pitch).floor() * pitch, header + (60.0 / pitch).round() * pitch);
-                let mut insts = vec![];
                 // Pixel fields go under the names: reserve their place in the paint order.
                 let field = ui.painter().add(egui::Shape::Noop);
                 ui.horizontal_wrapped(|ui| {
@@ -773,7 +895,9 @@ impl App {
                     for (d, space) in &self.drives {
                         let (r, resp) = ui.allocate_exact_size(size, Sense::click());
                         let r = layout::snap(Rect::from_min_size(r.min, size), pitch);
-                        let hov = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), HOVER_SECS);
+                        // Keyed by drive, not widget: the faded chooser of a transition (another Ui) and
+                        // the real one share it, so it never restarts from a stale hover.
+                        let hov = ui.ctx().animate_bool_with_time(egui::Id::unique(("drive", d)), resp.hovered(), HOVER_SECS);
                         let block = |rect: Rect, inten: f32, open: bool| Inst {
                             rect: [rect.min.x, rect.min.y, rect.max.x, rect.max.y],
                             color: gfx::rgba(FOLDER_RGB, inten),
@@ -795,20 +919,29 @@ impl App {
                             }
                             None => name.to_string(),
                         };
-                        let (p, y, font) = (ui.painter(), r.min.y + header * 0.5, FontId::proportional(12.0));
-                        p.text(pos2(r.min.x + 4.0, y), Align2::LEFT_CENTER, title, font, Color32::WHITE);
+                        if ghost.is_none() {
+                            let (p, y, font) = (ui.painter(), r.min.y + header * 0.5, FontId::proportional(12.0));
+                            p.text(pos2(r.min.x + 4.0, y), Align2::LEFT_CENTER, &title, font, Color32::WHITE);
+                        }
+                        titles.push((Rect::from_min_max(r.min, pos2(r.max.x, body.min.y)), title));
+                        blocks.push(r);
                         if resp.clicked() {
                             go = Some(d.clone());
+                            picked = Some((r, resp.interact_pointer_pos().unwrap_or(r.center())));
                         }
                     }
                 });
-                ui.painter().set(field, gfx::shape(ui.clip_rect(), insts, vec![], 0, &[]));
+                if ghost.is_none() {
+                    ui.painter().set(field, gfx::shape(ui.clip_rect(), insts.clone(), vec![], 0, &[]));
+                }
                 ui.add_space(14.0);
                 // Path field + Start span exactly the row of drives above.
                 let row = vec2(cols * size.x + (cols - 1.0) * gap, 28.0);
                 ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = gap;
-                    let start = ui.add(egui::Button::new("  Start  ").min_size(vec2(0.0, row.y))).clicked();
+                    let start = ui.add(egui::Button::new("  Start  ").min_size(vec2(0.0, row.y)));
+                    start_at = start.rect.center();
+                    let start = start.clicked();
                     let r = ui.add(
                         egui::TextEdit::singleline(&mut self.path_input)
                             .hint_text("C:\\Users")
@@ -823,9 +956,77 @@ impl App {
                 });
             });
         });
-        if let Some(p) = go {
+        let (block, click) = picked.map_or((None, start_at), |(r, c)| (Some(r), c));
+        let snap = Chooser { insts, titles, blocks, block, click, cam: None, card: 1.0 };
+        if let Some(p) = go.filter(|_| ghost.is_none()) {
             self.start(&p);
+            if self.tree.is_some() {
+                self.enter = Some(snap.clone());
+            }
         }
+        snap
+    }
+
+    /// The zoom out of the treemap into its drive's block on the chooser, the inverse of entering
+    /// (see [`Chooser`]): the chooser is the new top layer, the treemap shrinks under it. The tree is
+    /// dropped once that is done. A drive clicked meanwhile is entered at once, its zoom starting
+    /// from the chooser as it is on screen: false then (the caller goes on to draw that).
+    fn leave(&mut self, ui: &mut egui::Ui) -> bool {
+        let now = self.now();
+        let area = field_rect(ui.available_rect_before_wrap().shrink(1.0), self.pitch);
+        if self.left && self.anim.as_mut().is_none_or(|a| !a.prune(area, now)) {
+            // Done: the real chooser takes over this very frame (no blank frame between).
+            self.reset_nav();
+            self.tree = None;
+            self.chooser(ui, None);
+            return true;
+        }
+        // The chooser, laid out (for where its drives are) and drawn as its card only, which fades
+        // in over the end of the zoom.
+        let k = self.anim.as_ref().filter(|_| self.left).and_then(|a| a.steps.last()).map_or(0.0, |s| s.k(now));
+        let card = ((k - (1.0 - CARD_FADE)) / CARD_FADE).clamp(0.0, 1.0);
+        let top = self.chooser(ui, Some(card));
+        // The chooser's camera now (the top layer's), or of whatever transition this leaves from.
+        let cam = self.anim.as_ref().map_or((area, area), |a| *a.cams(area, now).last().unwrap());
+        // Its widgets sit where it will come to rest: hit-test a click through where it is now.
+        if self.left
+            && let Some(click) = ui.input(|i| i.pointer.primary_clicked().then(|| i.pointer.interact_pos()).flatten()).filter(|&at| area.contains(at)).map(|at| apply(inverse(cam), at))
+            && let Some(i) = top.blocks.iter().position(|b| b.contains(click))
+        {
+            let drive = self.drives[i].0.clone();
+            self.start(&drive);
+            if !self.leaving {
+                // Started (a fresh tree): zoom into the drive from here.
+                self.enter = Some(Chooser { block: Some(top.blocks[i]), click, cam: Some(cam), card, ..top });
+                return false;
+            }
+        }
+        let t = self.tree.as_ref().unwrap();
+        if !self.left {
+            // Like a zoom out to a parent folder: the old view shrinks into the drive's block (none
+            // for a scanned folder: the wave alone), stacked on whatever transition is running.
+            self.left = true;
+            let root = &*t.dirs[0].name;
+            let block = self.drives.iter().position(|d| d.0.eq_ignore_ascii_case(root)).map(|i| top.blocks[i]);
+            let old = std::mem::take(&mut self.tiles);
+            let (rel, origin, rect, outside) = match block {
+                Some(b) => ((area, b), b.center(), b, true),
+                None => ((area, area), area.center(), area, false),
+            };
+            let a = self.anim.get_or_insert_with(|| Anim { steps: vec![], v0: area });
+            a.v0 = view_after(cam, rel, area);
+            a.steps.push(Step { old, rel, local: false, anchor: None, t0: now, origin, rect, outside, at: None, chooser: None });
+            if a.steps.len() > gfx::MAX_WAVES {
+                a.steps.remove(0);
+            }
+        }
+        let a = self.anim.as_ref().unwrap();
+        let cams = a.cams(area, now);
+        let waves = a.waves(&cams, now);
+        let (mut insts, mut labels) = (vec![], vec![]);
+        self.layers(t, &a.steps, &cams, area, Some(&top), &mut insts, &mut labels);
+        paint_field(ui, area, insts, labels, &waves);
+        true
     }
 
     fn treemap(&mut self, ui: &mut egui::Ui) {
@@ -839,12 +1040,7 @@ impl App {
             self.built.clear();
             self.anim = None;
         }
-        let room = area.shrink(1.0);
-        let area = layout::snap(room, pitch);
-        // Its left column is gutter (dark), its right edge not: shift it by whole dots so what is lit
-        // sits centred across.
-        let off = ((area.min.x + pitch - room.min.x) - (room.max.x - area.max.x)) * 0.5;
-        let area = area.translate(vec2(-(off / pitch).round() * pitch, 0.0));
+        let area = field_rect(area.shrink(1.0), pitch);
         let now = self.now();
         if self.anim.as_mut().is_some_and(|a| !a.prune(area, now)) {
             self.anim = None;
@@ -950,12 +1146,21 @@ impl App {
                     a.v0 = view_after(cam, rel, area);
                     let local = from == to;
                     let at = (local || a.steps.last().is_some_and(|s| s.local)).then(|| index(&old));
-                    a.steps.push(Step { old, rel, local, anchor, t0: now, origin, rect, outside, at });
+                    a.steps.push(Step { old, rel, local, anchor, t0: now, origin, rect, outside, at, chooser: None });
                     if a.steps.len() > gfx::MAX_WAVES {
                         a.steps.remove(0); // shortcut: the oldest layer flips at once; needs 5 clicks inside one transition
                     }
                 } else if structural {
                     self.anim = None;
+                }
+                // A scan's first layout: zoom into it out of the chooser (from the picked drive).
+                if prev.0 == u32::MAX
+                    && let Some(c) = self.enter.take()
+                {
+                    let rel = (c.block.unwrap_or(area), area);
+                    let (origin, v0) = (apply(rel, c.click), view_after(c.cam.unwrap_or((area, area)), rel, area));
+                    let step = Step { old: vec![], rel, local: false, anchor: None, t0: now, origin, rect: area, outside: false, at: None, chooser: Some(c) };
+                    self.anim = Some(Anim { steps: vec![step], v0 });
                 }
                 self.layout_key = key;
             }
@@ -983,7 +1188,6 @@ impl App {
         let t = self.tree.as_ref().unwrap();
         let mut insts = Vec::with_capacity(self.tiles.len() * 2 + 8);
         let mut labels = vec![];
-        let mut boxes = vec![];
         let (steps, cams, waves) = match &self.anim {
             Some(a) => {
                 let cams = a.cams(area, now);
@@ -994,70 +1198,13 @@ impl App {
         };
         {
             let _s = perf::span("layers");
-            self.layers(t, steps, &cams, area, &mut insts, &mut labels);
+            self.layers(t, steps, &cams, area, None, &mut insts, &mut labels);
         }
         perf::add("#tiles", self.tiles.len() as f64);
         perf::add("#insts", insts.len() as f64);
         perf::add("#labels", labels.len() as f64);
-        let labels_t = perf::span("labels");
         self.cam = *cams.last().unwrap();
-        let painter = ui.painter().with_clip_rect(area.expand(1.0).intersect(ui.clip_rect()));
-        // The pixel layer goes under the labels, but its quiet zones are only known once the labels
-        // are laid out: reserve its place in the paint order now, fill it in after.
-        let field = painter.add(egui::Shape::Noop);
-        for l in labels {
-            let jitter = ((l.pos.x * 12.9898 + l.pos.y * 78.233).sin() * 43758.547).fract().abs();
-            let es: Vec<f32> = waves.iter().map(|w| w.at(l.pos, jitter)).collect();
-            // Outgoing labels fade as a whole, incoming ones type in; the dark patch under a file
-            // label follows the same amount, so it never outstays (or precedes) its text.
-            let (f_in, fade) = shown(&es, l.lo, l.hi, l.fixed);
-            if f_in * fade <= 0.0 {
-                continue;
-            }
-            let typed = |s: &str| typed(s, f_in);
-            // Static labels always fit their tile, so they share the treemap's clip and egui draws all
-            // text in one batch; only mid-transition (tiles resizing under them) are they clipped
-            // per tile. No shadow: labels sit on a dark title strip or a dimmed quiet zone.
-            let p = if !waves.is_empty() { painter.with_clip_rect(l.clip.intersect(painter.clip_rect())) } else { painter.clone() };
-            let font = FontId::proportional(l.size);
-            let white = Color32::from_white_alpha((0.92 * fade * 255.0) as u8);
-            if l.sub.is_empty() {
-                // Title strip: "name - size", elided at the end when too wide.
-                let mut job = egui::text::LayoutJob::simple_singleline(typed(&l.text), font, white);
-                job.wrap.max_width = l.clip.max.x - l.pos.x;
-                job.wrap.max_rows = 1;
-                job.wrap.break_anywhere = true;
-                let g = p.layout_job(job);
-                p.galley(l.pos - vec2(0.0, g.size().y * 0.5), g, white);
-                continue;
-            }
-            // File: name wrapped to at most 2 lines, size below; if that doesn't fit, no label at all.
-            let wrapped = |s: String| {
-                let mut job = egui::text::LayoutJob::simple(s, font.clone(), white, l.room.x);
-                job.wrap.max_rows = 2;
-                job.wrap.break_anywhere = true;
-                job.halign = egui::Align::Center;
-                p.layout_job(job)
-            };
-            let (full, sub) = (wrapped(l.text.clone()), p.layout_no_wrap(l.sub.clone(), font.clone(), white));
-            if full.elided || sub.size().x > l.room.x || full.size().y + sub.size().y > l.room.y {
-                continue;
-            }
-            let bx = Rect::from_center_size(l.pos, vec2(full.size().x.max(sub.size().x), full.size().y + sub.size().y));
-            if boxes.len() == gfx::NO_LABEL as usize {
-                continue; // shortcut: no dark patch left for it, so no text; only ever this many fit on screen
-            }
-            insts[l.inst].p[1] = boxes.len() as u8;
-            insts[l.inst].q[2] = gfx::unorm(f_in * fade);
-            boxes.push([bx.min.x, bx.min.y, bx.max.x, bx.max.y]);
-            let (name, sub) = if f_in < 1.0 { (wrapped(typed(&l.text)), p.layout_no_wrap(typed(&l.sub), font.clone(), white)) } else { (full.clone(), sub) };
-            let top = l.pos.y - (full.size().y + sub.size().y) * 0.5;
-            for (g, y) in [(name, top), (sub, top + full.size().y)] {
-                p.galley(pos2(l.pos.x, y) - g.rect.center_top().to_vec2(), g, white);
-            }
-        }
-        drop(labels_t);
-        painter.set(field, gfx::shape(area, insts, boxes, 1, &waves.iter().map(Wave::gpu).collect::<Vec<_>>()));
+        paint_field(ui, area, insts, labels, &waves);
 
         // Interaction.
         // Own tooltip instead of egui's: shown at once and kept up while the tiles change under a
@@ -1133,7 +1280,9 @@ impl App {
     /// Draw the layer stack: layer j (`steps[j].old`, the top one the current tiles) under camera
     /// `cams[j]`. A tile an expand/collapse left unchanged belongs to both layers around it: drawn
     /// once, untouched by that wave.
-    fn layers(&self, t: &Tree, steps: &[Step], cams: &[Map], area: Rect, insts: &mut Vec<Inst>, labels: &mut Vec<Label>) {
+    /// `chooser_top`: the chooser is the top layer (leaving), over `self.tiles` (moved into the last step).
+    #[allow(clippy::too_many_arguments)]
+    fn layers(&self, t: &Tree, steps: &[Step], cams: &[Map], area: Rect, chooser_top: Option<&Chooser>, insts: &mut Vec<Inst>, labels: &mut Vec<Label>) {
         let n = steps.len();
         let layer = |j: usize| if j < n { &steps[j].old[..] } else { &self.tiles[..] };
         let local = |j: usize| j < n && steps[j].local;
@@ -1142,6 +1291,18 @@ impl App {
         let at = |j: usize| if j < n { steps[j].at.as_ref() } else { top.as_ref() };
         let same = |j: usize, x: &Tile| at(j).is_some_and(|m| m.get(&x.item) == Some(&(x.rect, x.open)));
         for j in 0..=n {
+            if let Some(c) = if j < n { steps[j].chooser.as_ref() } else { chooser_top } {
+                let cam = cams[j];
+                for i in &c.insts {
+                    let r = apply_rect(cam, Rect::from_min_max(pos2(i.rect[0], i.rect[1]), pos2(i.rect[2], i.rect[3])));
+                    insts.push(Inst { rect: [r.min.x, r.min.y, r.max.x, r.max.y], p: [i.p[0], i.p[1], j as u8, j as u8], ..*i });
+                }
+                for (strip, text) in &c.titles {
+                    let r = apply_rect(cam, *strip);
+                    let pos = pos2(r.min.x + 4.0, r.center().y);
+                    labels.push(Label { lo: j, hi: j, fixed: false, clip: r, pos, text: text.clone(), sub: String::new(), room: Vec2::ZERO, size: 12.0, inst: 0 });
+                }
+            }
             for x in layer(j) {
                 if j > 0 && local(j - 1) && same(j - 1, x) {
                     continue; // drawn with the layer below
@@ -1377,8 +1538,21 @@ impl eframe::App for App {
             .frame(egui::Frame::NONE.fill(BG).inner_margin(Margin { left: 10, right: 10, top: 2, bottom: 4 }))
             .show(ui, |ui| {
                 if self.tree.is_none() {
-                    self.chooser(ui);
+                    self.chooser(ui, None);
                     return;
+                }
+                if self.leaving && self.leave(ui) {
+                    return;
+                }
+                // Just left the chooser: its card fades over the start of the zoom out of it.
+                let now = self.now();
+                let card = match (&self.enter, self.anim.as_ref().and_then(|a| a.steps.first())) {
+                    (Some(c), _) => Some(c.card),
+                    (_, Some(s @ Step { chooser: Some(c), .. })) => Some(c.card * (1.0 - s.k(now) / CARD_FADE)),
+                    _ => None,
+                };
+                if let Some(a) = card.filter(|&a| a > 0.0) {
+                    self.chooser(ui, Some(a));
                 }
                 {
                     let _s = perf::span("treemap");
