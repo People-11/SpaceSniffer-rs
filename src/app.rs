@@ -364,7 +364,6 @@ pub struct App {
     tree: Option<Tree>,
     scan: Option<tree::Scan>,
     scan_t0: Instant,
-    disk: Option<(u64, u64)>,
     view: u32,
     back: Vec<u32>,
     fwd: Vec<u32>,
@@ -406,7 +405,6 @@ pub struct App {
     path_input: String,
     drives: Vec<(String, Option<(u64, u64)>)>,
     status: String,
-    title: String,
     /// Frame timestamps of the last second, and smoothed CPU time per frame (ms).
     frames: std::collections::VecDeque<Instant>,
     cpu_ms: f32,
@@ -423,7 +421,6 @@ impl App {
             tree: None,
             scan: None,
             scan_t0: now,
-            disk: None,
             view: 0,
             back: vec![],
             fwd: vec![],
@@ -454,14 +451,11 @@ impl App {
             path_input: String::new(),
             drives: win::drives(),
             status: "Ready".into(),
-            title: String::new(),
             frames: Default::default(),
             cpu_ms: 0.0,
         };
         if let Some(rs) = cc.wgpu_render_state.as_ref() {
-            let i = rs.adapter.get_info();
-            let mode = if app.mailbox { "Mailbox + DwmFlush" } else { "Fifo" };
-            app.gpu_info = format!("{:?} · {} · {}", i.backend, mode, i.name);
+            app.gpu_info = rs.adapter.get_info().name;
         }
         if let Some(p) = std::env::args().nth(1) {
             app.start(&p);
@@ -492,7 +486,6 @@ impl App {
         }
         // Every path shown, opened or recycled is built from the root: make it absolute.
         let pb = std::path::absolute(&pb).unwrap_or(pb);
-        self.disk = win::disk_space(&pb);
         self.tree = Some(Tree::new(&pb.to_string_lossy()));
         self.reset_nav();
         self.begin_scan(pb, 0, 1);
@@ -531,7 +524,6 @@ impl App {
         let path = t.path(Item::Dir(self.view));
         t.clear_dir(self.view);
         let next = t.dirs.len() as u32;
-        self.disk = win::disk_space(&t.path(Item::Dir(0)));
         self.anim = None;
         // The old tiles index files that are gone, and the history can lead into orphaned dirs.
         self.tiles.clear();
@@ -560,7 +552,6 @@ impl App {
         if done {
             self.scan = None;
             let secs = self.scan_t0.elapsed().as_secs_f32();
-            self.disk = win::disk_space(&t.path(Item::Dir(0)));
             self.status = format!("Ready · scanned in {secs:.2}s");
         }
     }
@@ -627,9 +618,6 @@ impl App {
         // Files of that dir changed index (swap_remove): never hit-test those stale tiles.
         if let Item::File(d, _) = item {
             self.tiles.retain(|x| !matches!(x.item, Item::File(e, _) if e == d));
-        }
-        if let Some((tot, free)) = self.disk.as_mut() {
-            *free = (*free + freed).min(*tot);
         }
         self.status = format!("Moved to Recycle Bin: {} ({})", path.display(), fmt_size(freed));
     }
@@ -851,7 +839,12 @@ impl App {
             self.built.clear();
             self.anim = None;
         }
-        let area = layout::snap(area.shrink(1.0), pitch);
+        let room = area.shrink(1.0);
+        let area = layout::snap(room, pitch);
+        // Its left column is gutter (dark), its right edge not: shift it by whole dots so what is lit
+        // sits centred across.
+        let off = ((area.min.x + pitch - room.min.x) - (room.max.x - area.max.x)) * 0.5;
+        let area = area.translate(vec2(-(off / pitch).round() * pitch, 0.0));
         let now = self.now();
         if self.anim.as_mut().is_some_and(|a| !a.prune(area, now)) {
             self.anim = None;
@@ -1396,20 +1389,6 @@ impl eframe::App for App {
             });
 
         self.delete_modal(&ctx);
-
-        let title = match (&self.tree, self.disk) {
-            (Some(t), Some((_, free))) => format!(
-                "SpaceSniffer-rs - [{} ({} free)] - {}",
-                t.dirs[0].name,
-                fmt_size(free),
-                if self.scan.is_some() { "Scanning…" } else { "Ready" }
-            ),
-            _ => "SpaceSniffer-rs".into(),
-        };
-        if title != self.title {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
-            self.title = title;
-        }
 
         self.cpu_ms = self.cpu_ms * 0.9 + frame_t0.elapsed().as_secs_f32() * 1000.0 * 0.1;
         perf::frame(frame_t0.elapsed().as_secs_f64() * 1e3);
