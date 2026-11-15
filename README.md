@@ -17,10 +17,11 @@
 
 ## 渲染
 
-- egui + wgpu（仅 Vulkan，需要支持 Vulkan 的显卡驱动，优先独显）：surface 支持时用 `PresentMode::Mailbox` + 每帧 `DwmFlush()` 对齐合成器节奏（无 busy-wait），否则回退 Fifo
+- egui + wgpu（仅 Vulkan，需要支持 Vulkan 的显卡驱动，优先独显）：`PresentMode::Fifo`（Vulkan 的 Fifo 是真正阻塞等待垂直同步，不像 OpenGL 在 NVIDIA 上会忙等）
 - 像素场是 5 级亮度的有序抖动（4×4 Bayer 矩阵），块之间靠抖动图案、亮度档和左上暗线区分；小到画不出暗线的文件统一收进所在文件夹右下角的一块，这一块共用一条左上暗线；点阵、像素波和粒子都在一个 instanced WGSL shader 里完成，每个矩形 1 个实例
 - 每个点阵单元只算一次：先按「一个单元一个像素」渲染到离屏纹理，再放大贴到屏幕，4K 下着色量只有全分辨率的 1/9–1/16；不覆盖任何单元中心的块（缩小到看不见、或移出屏幕的）直接剔除
 - 画面静止时不重绘，只在扫描、动画或输入时出帧；状态栏显示显卡、帧率和每帧 CPU 耗时
+- 拖动标题栏只移动窗口、不重绘：纯移动的 `WM_WINDOWPOSCHANGED` 不交给 winit（见 `win::setup_window`），否则每一步都要出一帧并等垂直同步，窗口会跟不上鼠标
 
 ## 构建
 
@@ -28,6 +29,10 @@
 cargo build --release
 ```
 
-产物 `target/release/spacesniffer-rs.exe`（约 6 MB），静态 CRT，无额外 DLL；不内嵌字体，使用系统自带的 Segoe UI / 微软雅黑 / Segoe UI Symbol，工具栏图标用 Segoe Fluent Icons（Windows 10 上用 Segoe MDL2 Assets）。CI 见 `.github/workflows/build.yml`。
+产物 `target/release/spacesniffer-rs.exe`（约 5.6 MB），静态 CRT，无额外 DLL；需要支持 x86-64-v2（SSE4.2）的 CPU（Windows 11 24H2 本身的要求），见 `.cargo/config.toml`；不内嵌字体，使用系统自带的 Segoe UI / 微软雅黑 / Segoe UI Symbol，工具栏图标用 Segoe Fluent Icons（Windows 10 上用 Segoe MDL2 Assets）。CI 见 `.github/workflows/build.yml`。
 
 `cargo build --release --features perf` 构建带控制台的性能调试版，每秒输出各阶段的帧耗时。
+
+体积相关：
+- 窗口图标由 `build.rs` 把 `assets/icon.ico` 编进 exe 资源，运行时从资源加载（Windows 自己解码），不在程序里解码 PNG；GNU 工具链需要 `windres`（随 MinGW gcc 提供），否则没有图标。
+- eframe 只为图标依赖 `image`（png/deflate/crc32），剪贴板库 arboard 也只为图片剪贴板依赖它，所以用 `[patch]` 换成了 `stub/image` 存根：图片复制粘贴不可用，文本剪贴板不受影响。升级 eframe/arboard 时若存根编译失败，按报错补齐签名。

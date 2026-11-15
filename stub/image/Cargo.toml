@@ -1,0 +1,12 @@
+[package]
+name = "image"
+version = "0.25.10"
+edition = "2021"
+description = "Stub of the image crate API used by eframe (icons) and arboard (clipboard images): everything reports unsupported."
+publish = false
+
+[features]
+default = []
+png = []
+bmp = []
+tiff = []

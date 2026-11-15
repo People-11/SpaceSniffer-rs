@@ -4,7 +4,6 @@ use crate::perf;
 use crate::tree::{self, CATS, Item, ItemMap, Tree};
 use crate::win;
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Key, Margin, PointerButton, Pos2, Rect, RichText, Sense, Vec2, pos2, vec2};
-use eframe::egui_wgpu::SurfaceConfig;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -554,9 +553,6 @@ pub struct App {
     /// Going back to the chooser (see `App::leave`); `left`: its zoom has started.
     leaving: bool,
     left: bool,
-    /// Surface supports Mailbox: switch to it on the first frame and pace with DwmFlush.
-    mailbox: bool,
-    started: bool,
     gpu_info: String,
     hover: Option<Item>,
     menu_item: Option<Item>,
@@ -593,6 +589,7 @@ impl App {
             gfx::init(rs);
         }
         setup_style(&cc.egui_ctx);
+        win::setup_window(cc);
         let now = Instant::now();
         let mut app = Self {
             tree: None,
@@ -611,8 +608,6 @@ impl App {
             anim: None,
             leaving: false,
             left: false,
-            mailbox: cc.wgpu_render_state.as_ref().is_some_and(|rs| supports_mailbox(cc, rs)),
-            started: false,
             gpu_info: String::new(),
             hover: None,
             menu_item: None,
@@ -1556,14 +1551,6 @@ impl App {
     }
 }
 
-/// Probe the window's surface for Mailbox support on the adapter eframe picked.
-fn supports_mailbox(cc: &eframe::CreationContext, rs: &eframe::egui_wgpu::RenderState) -> bool {
-    // SAFETY: the window outlives this temporary surface, which is dropped before returning.
-    let Ok(target) = (unsafe { wgpu::SurfaceTargetUnsafe::from_window(cc) }) else { return false };
-    let Ok(surface) = (unsafe { rs.instance.create_surface_unsafe(target) }) else { return false };
-    surface.get_capabilities(&rs.adapter).present_modes.contains(&wgpu::PresentMode::Mailbox)
-}
-
 /// Toolbar button with a Segoe Fluent / MDL2 glyph; `key`: its shortcut was pressed (only acts when enabled).
 fn tool(ui: &mut egui::Ui, icon: &str, tip: &str, enabled: bool, key: bool) -> bool {
     let icon = RichText::new(icon).size(15.0).family(egui::FontFamily::Name("icons".into()));
@@ -1612,21 +1599,9 @@ fn setup_style(ctx: &egui::Context) {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        if !self.started {
-            self.started = true;
-            if self.mailbox {
-                frame.set_wgpu_surface_config(SurfaceConfig { present_mode: wgpu::PresentMode::Mailbox, desired_maximum_frame_latency: Some(1) });
-            }
-        }
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         // The whole previous frame on the CPU as eframe saw it (incl. tessellation and painting).
         perf::add("prev-cpu", frame.info().cpu_usage.unwrap_or(0.0) as f64 * 1e3);
-        // Fifo already blocks in present; DwmFlush there would only add a second wait.
-        if self.mailbox && !minimized {
-            // Mailbox never blocks; DwmFlush paces us to the compositor without a GPU busy-wait.
-            let _s = perf::span("dwm-wait");
-            win::dwm_flush();
-        }
         let frame_t0 = Instant::now();
         self.frames.push_back(frame_t0);
         while self.frames.front().is_some_and(|t| frame_t0.duration_since(*t).as_secs_f32() > 1.0) {
