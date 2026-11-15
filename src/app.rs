@@ -1324,10 +1324,10 @@ impl App {
         {
             let size = t.size(item);
             let (name, extra) = match item {
-                Item::Dir(d) => (&t.dirs[d as usize].name, format!("{} files", t.dirs[d as usize].nfiles)),
+                Item::Dir(d) => (&*t.dirs[d as usize].name, format!("{} files", t.dirs[d as usize].nfiles)),
                 Item::File(d, f) => {
-                    let x = &t.dirs[d as usize].files[f as usize];
-                    (&x.name, CATS[x.cat as usize].0.to_string())
+                    let x = &t.dirs[d as usize];
+                    (x.file_name(f), CATS[x.files[f as usize].cat as usize].0.to_string())
                 }
             };
             egui::Area::new(egui::Id::unique("tile_tip")).order(egui::Order::Tooltip).fixed_pos((at + vec2(14.0, 18.0)).round()).interactable(false).show(
@@ -1335,7 +1335,7 @@ impl App {
                 |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                        ui.label(RichText::new(&**name).strong());
+                        ui.label(RichText::new(name).strong());
                         ui.label(format!("{}  ·  {}", fmt_size(size), extra));
                     });
                 },
@@ -1485,7 +1485,7 @@ impl App {
         let lr = tile.rect;
         let info = || match item {
             Item::Dir(d) => t.dirs.get(d as usize).map(|x| (x.size, &*x.name)),
-            Item::File(d, f) => t.dirs.get(d as usize).and_then(|x| x.files.get(f as usize)).map(|x| (x.size, &*x.name)),
+            Item::File(d, f) => t.dirs.get(d as usize).and_then(|x| Some((x.files.get(f as usize)?.size, x.file_name(f)))),
         };
         if tile.open {
             let Some((size, name)) = info() else { return };
@@ -1580,14 +1580,14 @@ fn setup_style(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::empty();
     let mut list = vec![];
     for file in ["segoeui.ttf", "msyh.ttc", "seguisym.ttf"] {
-        if let Ok(bytes) = std::fs::read(format!(r"C:\Windows\Fonts\{file}")) {
-            fonts.font_data.insert(file.into(), egui::FontData::from_owned(bytes).into());
+        if let Some(bytes) = win::map_file(&format!(r"C:\Windows\Fonts\{file}")) {
+            fonts.font_data.insert(file.into(), egui::FontData::from_static(bytes).into());
             list.push(file.to_string());
         }
     }
     let mut icons = vec![];
-    if let Some((file, bytes)) = ["SegoeIcons.ttf", "segmdl2.ttf"].iter().find_map(|f| Some((f, std::fs::read(format!(r"C:\Windows\Fonts\{f}")).ok()?))) {
-        fonts.font_data.insert(file.to_string(), egui::FontData::from_owned(bytes).into());
+    if let Some((file, bytes)) = ["SegoeIcons.ttf", "segmdl2.ttf"].iter().find_map(|f| Some((f, win::map_file(&format!(r"C:\Windows\Fonts\{f}"))?))) {
+        fonts.font_data.insert(file.to_string(), egui::FontData::from_static(bytes).into());
         icons.push(file.to_string());
     }
     fonts.families.insert(egui::FontFamily::Name("icons".into()), icons.into_iter().chain(list.clone()).collect());
@@ -1824,9 +1824,9 @@ mod tests {
         //   │   └ 4
         //   └ 2 ─ 5
         let mut t = Tree::new("R");
-        t.apply(tree::Batch { id: 0, files: vec![], dirs: vec![(1, "a".into()), (2, "b".into())] });
-        t.apply(tree::Batch { id: 1, files: vec![], dirs: vec![(3, "c".into()), (4, "d".into())] });
-        t.apply(tree::Batch { id: 2, files: vec![], dirs: vec![(5, "e".into())] });
+        t.apply(tree::Batch::of(0, [], vec![(1, "a".into()), (2, "b".into())]));
+        t.apply(tree::Batch::of(1, [], vec![(3, "c".into()), (4, "d".into())]));
+        t.apply(tree::Batch::of(2, [], vec![(5, "e".into())]));
         let mut ex = HashSet::new();
         assert!(toggle(&t, &mut ex, 1, false));
         assert!(toggle(&t, &mut ex, 3, false));

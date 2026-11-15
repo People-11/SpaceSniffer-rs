@@ -17,6 +17,32 @@ pub fn below_normal() {
     unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
 }
 
+/// Map a file read-only for the rest of the process. Pages load on first touch and stay file-backed
+/// (shared, evictable), so a 20 MB font costs only the glyphs drawn, not 20 MB of private heap.
+pub fn map_file(path: &str) -> Option<&'static [u8]> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, GetFileSizeEx, OPEN_EXISTING};
+    use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_READ, MapViewOfFile, PAGE_READONLY};
+    let w: Vec<u16> = path.encode_utf16().chain([0]).collect();
+    unsafe {
+        let f = CreateFileW(w.as_ptr(), GENERIC_READ, FILE_SHARE_READ, std::ptr::null(), OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, std::ptr::null_mut());
+        if f == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut size = 0i64;
+        let ok = GetFileSizeEx(f, &mut size) != 0 && size > 0;
+        let m = if ok { CreateFileMappingW(f, std::ptr::null(), PAGE_READONLY, 0, 0, std::ptr::null()) } else { std::ptr::null_mut() };
+        CloseHandle(f);
+        if m.is_null() {
+            return None;
+        }
+        // The view keeps the mapping alive; it is never unmapped (fonts live as long as the app).
+        let view = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+        CloseHandle(m);
+        (!view.Value.is_null()).then(|| std::slice::from_raw_parts(view.Value as *const u8, size as usize))
+    }
+}
+
 /// Drive roots (instant: no drive is asked anything).
 pub fn drives() -> Vec<String> {
     let mask = unsafe { GetLogicalDrives() };

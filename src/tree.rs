@@ -51,9 +51,12 @@ pub fn category(name: &str) -> u8 {
     }
 }
 
+/// 16 bytes; the name lives in the parent dir's `names` (one allocation per dir instead of one per
+/// file: about 30 bytes less per file, ~15 MB on half a million files).
 pub struct File {
-    pub name: Box<str>,
     pub size: u64,
+    name_at: u32,
+    name_len: u16,
     pub cat: u8,
 }
 
@@ -65,6 +68,15 @@ pub struct Dir {
     pub nfiles: u64,
     pub dirs: Vec<u32>,
     pub files: Vec<File>,
+    /// Names of `files`, back to back.
+    names: String,
+}
+
+impl Dir {
+    pub fn file_name(&self, f: u32) -> &str {
+        let x = &self.files[f as usize];
+        &self.names[x.name_at as usize..][..x.name_len as usize]
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -119,7 +131,7 @@ impl Tree {
     pub fn path(&self, item: Item) -> PathBuf {
         let (mut d, file) = match item {
             Item::Dir(d) => (d, None),
-            Item::File(d, f) => (d, Some(&*self.dirs[d as usize].files[f as usize].name)),
+            Item::File(d, f) => (d, Some(self.dirs[d as usize].file_name(f))),
         };
         let mut parts = vec![];
         loop {
@@ -144,8 +156,7 @@ impl Tree {
     }
 
     pub fn apply(&mut self, b: Batch) {
-        let files: Vec<File> = b.files.into_iter().map(|(name, size)| File { cat: category(&name), name, size }).collect();
-        let (sz, n) = (files.iter().map(|f| f.size).sum(), files.len() as u64);
+        let (sz, n) = (b.files.iter().map(|f| f.size).sum(), b.files.len() as u64);
         let max = b.dirs.iter().map(|d| d.0).max().unwrap_or(0) as usize;
         if max >= self.dirs.len() {
             self.dirs.resize_with(max + 1, Dir::default);
@@ -156,7 +167,8 @@ impl Tree {
             ids.push(cid);
         }
         let d = &mut self.dirs[b.id as usize];
-        d.files = files;
+        d.files = b.files;
+        d.names = b.names;
         d.dirs = ids;
         self.add_up(b.id, sz, n, true);
         self.version += 1;
@@ -189,6 +201,7 @@ impl Tree {
         let x = &mut self.dirs[d as usize];
         x.dirs.clear();
         x.files.clear();
+        x.names.clear();
         self.version += 1;
     }
 
@@ -214,8 +227,28 @@ impl Tree {
 
 pub struct Batch {
     pub id: u32,
-    pub files: Vec<(Box<str>, u64)>,
+    pub files: Vec<File>,
+    names: String,
     pub dirs: Vec<(u32, Box<str>)>,
+}
+
+impl Batch {
+    pub fn new(id: u32) -> Self {
+        Self { id, files: vec![], names: String::new(), dirs: vec![] }
+    }
+
+    pub fn push_file(&mut self, name: &str, size: u64) {
+        let (name_at, name_len) = (self.names.len() as u32, name.len() as u16); // NTFS names: <= 765 UTF-8 bytes
+        self.files.push(File { size, name_at, name_len, cat: category(name) });
+        self.names.push_str(name);
+    }
+
+    #[cfg(test)]
+    pub fn of(id: u32, files: impl IntoIterator<Item = (Box<str>, u64)>, dirs: Vec<(u32, Box<str>)>) -> Self {
+        let mut b = Self { dirs, ..Self::new(id) };
+        files.into_iter().for_each(|(n, s)| b.push_file(&n, s));
+        b
+    }
 }
 
 pub enum Msg {
@@ -295,7 +328,7 @@ fn list(path: PathBuf, id: u32, tx: &Sender<Msg>, next: &AtomicU32, cancel: &Ato
     if cancel.load(Ordering::Relaxed) {
         return vec![];
     }
-    let mut b = Batch { id, files: vec![], dirs: vec![] };
+    let mut b = Batch::new(id);
     let mut sub = vec![];
     if let Ok(rd) = std::fs::read_dir(&path) {
         for e in rd.flatten() {
@@ -304,17 +337,20 @@ fn list(path: PathBuf, id: u32, tx: &Sender<Msg>, next: &AtomicU32, cancel: &Ato
             if ft.is_symlink() {
                 continue; // symlinks + junctions: avoid double counting and cycles
             }
-            let name: Box<str> = e.file_name().to_string_lossy().into();
+            let name = e.file_name();
+            let name = name.to_string_lossy();
             if ft.is_dir() {
                 let cid = next.fetch_add(1, Ordering::Relaxed);
                 sub.push((cid, e.path()));
-                b.dirs.push((cid, name));
+                b.dirs.push((cid, name.into()));
             } else {
-                let size = e.metadata().map_or(0, |m| m.len());
-                b.files.push((name, size));
+                b.push_file(&name, e.metadata().map_or(0, |m| m.len()));
             }
         }
     }
+    // Kept for the life of the tree: drop the growth slack (up to half of each buffer).
+    b.files.shrink_to_fit();
+    b.names.shrink_to_fit();
     // Parent batch must be sent before any child batch (children reference the parent's slots).
     if tx.send(Msg::Batch(b)).is_err() {
         return vec![];
@@ -356,20 +392,28 @@ mod tests {
     #[test]
     fn sizes_stay_consistent_through_delete_and_clear() {
         let mut t = Tree::new("R");
-        t.apply(Batch { id: 0, files: vec![("a".into(), 10), ("b".into(), 20)], dirs: vec![(1, "s".into()), (2, "u".into())] });
-        t.apply(Batch { id: 1, files: vec![("c".into(), 100), ("d".into(), 200)], dirs: vec![] });
-        t.apply(Batch { id: 2, files: vec![("e".into(), 1000)], dirs: vec![] });
+        let batch = |id, files: &[(&str, u64)], dirs: &[(u32, &str)]| {
+            let mut b = Batch::new(id);
+            files.iter().for_each(|&(n, s)| b.push_file(n, s));
+            b.dirs = dirs.iter().map(|&(c, n)| (c, n.into())).collect();
+            b
+        };
+        t.apply(batch(0, &[("a", 10), ("b.jpg", 20)], &[(1, "s"), (2, "u")]));
+        t.apply(batch(1, &[("c", 100), ("d", 200)], &[]));
+        t.apply(batch(2, &[("e", 1000)], &[]));
+        assert_eq!((t.dirs[0].file_name(1), t.dirs[0].files[1].cat), ("b.jpg", category("b.jpg")));
         let root = |t: &Tree| (t.dirs[0].size, t.dirs[0].nfiles);
         assert_eq!(root(&t), (1330, 5));
         // The path the Recycle Bin gets: root first, every level in order.
         assert_eq!(t.path(Item::File(1, 1)), PathBuf::from("R/s/d"));
         t.remove(Item::File(1, 0));
-        assert_eq!((root(&t), t.dirs[1].size, &*t.dirs[1].files[0].name), ((1230, 4), 200, "d"));
+        assert_eq!((root(&t), t.dirs[1].size, t.dirs[1].file_name(0)), ((1230, 4), 200, "d"));
         t.remove(Item::Dir(2));
         assert_eq!((root(&t), t.dirs[0].dirs.clone()), ((230, 3), vec![1]));
         t.clear_dir(1);
         assert_eq!((root(&t), t.dirs[1].size), ((30, 2), 0));
-        t.apply(Batch { id: 1, files: vec![("f".into(), 5)], dirs: vec![] }); // its rescan
+        t.apply(batch(1, &[("f", 5)], &[])); // its rescan
+        assert_eq!(t.dirs[1].file_name(0), "f");
         assert_eq!(root(&t), (35, 3));
     }
 
