@@ -158,7 +158,7 @@ fn fs(v: V) -> @location(0) vec4f {
     let g = 1.0 - (rd.x + rd.y) / (ts.x + ts.y);
     let k = round(tone * 3.0);
     var n = 1.3 + 0.4 * k + 0.2 * floor(k * 0.5) + (g - 0.5) * 0.35;
-    n = mix(n, 3.9, hover);
+    n = mix(n, 3.4, hover); // a level below the wave's light, which then still shows on a lit tile
     // The wave's light lifts the tile's own levels (no white overlay): the pattern itself glows
     // and settles back as it cools.
     n = min(n + 2.0 * born, 3.9);

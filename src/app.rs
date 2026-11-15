@@ -185,6 +185,17 @@ struct Step {
     at: Option<At>,
     /// The drive chooser, when that is what this step leaves (`old` is empty then).
     chooser: Option<Chooser>,
+    /// `old`'s hover light when the step began, kept until the wave flips it (the live light moves
+    /// on: what is clicked is no longer hovered once the new layout is under the pointer).
+    lit: Lit,
+}
+
+/// Hover light of a layout: directly lit tiles (the hovered one and its parent; a handful), eased
+/// 0..1; and the rects of folders whose whole block is lit, with their eased lift.
+#[derive(Clone, Default)]
+struct Lit {
+    tiles: Vec<(Item, f32)>,
+    groups: Vec<(Rect, f32)>,
 }
 
 /// The drive chooser as a layer of a transition: the bottom one of the zoom into a scan (as it was
@@ -236,6 +247,23 @@ struct Anim {
 }
 
 impl Anim {
+    /// Stack `step` on the running transition (or start one), its layout taking over from what is
+    /// on screen now: `cam`, the camera of the layout under it. Past MAX_WAVES the oldest layer
+    /// flips at once.
+    fn push(anim: &mut Option<Anim>, cam: Map, area: Rect, step: Step) {
+        let a = anim.get_or_insert_with(|| Anim { steps: vec![], v0: area });
+        a.v0 = view_after(cam, step.rel, area);
+        a.steps.push(step);
+        if a.steps.len() > gfx::MAX_WAVES {
+            a.steps.remove(0); // shortcut: the oldest layer flips at once; needs 5 clicks inside one transition
+        }
+    }
+
+    /// Camera of the top layout now (at rest: none).
+    fn cam_now(anim: &Option<Anim>, area: Rect, now: f32) -> Map {
+        anim.as_ref().map_or((area, area), |a| *a.cams(area, now).last().unwrap())
+    }
+
     /// Camera (layout -> screen) of every layer, bottom first.
     fn cams(&self, area: Rect, now: f32) -> Vec<Map> {
         let mut c = top_cam(self.v0, area, ease(self.steps.last().map_or(1.0, |s| s.k(now))));
@@ -476,8 +504,6 @@ pub struct App {
     /// Dir whose expand/collapse produced the pending relayout.
     toggled: Option<u32>,
     anim: Option<Anim>,
-    /// A drive was just picked: the chooser to zoom out of once the scan's first layout is in.
-    enter: Option<Chooser>,
     /// Going back to the chooser (see `App::leave`); `left`: its zoom has started.
     leaving: bool,
     left: bool,
@@ -493,12 +519,11 @@ pub struct App {
     /// Dot lattice pitch and folder title height (points) for the current DPI.
     pitch: f32,
     header: f32,
-    /// Directly lit tiles (hovered + its parent; a handful): lifted and eased to the top tone, 0..1.
-    hover_fx: Vec<(Item, f32)>,
+    /// Hover light of the current layout.
+    lit: Lit,
     /// Folders whose whole block is lit (hovered title): lift 0..1. Kept per folder, not per tile,
-    /// so lighting 10k blocks costs nothing; `group_lit` is its per-frame (rect, eased lift) form.
+    /// so lighting 10k blocks costs nothing; `lit.groups` is its per-frame form.
     group_fx: Vec<(Item, f32)>,
-    group_lit: Vec<(Rect, f32)>,
     /// Camera of the target layout last frame (layout rect -> screen rect), for hit-testing mid-zoom.
     cam: Map,
     confirm: Option<Item>,
@@ -538,7 +563,6 @@ impl App {
             click_pos: None,
             toggled: None,
             anim: None,
-            enter: None,
             leaving: false,
             left: false,
             mailbox: cc.wgpu_render_state.as_ref().is_some_and(|rs| supports_mailbox(cc, rs)),
@@ -549,9 +573,8 @@ impl App {
             last_press: None,
             pitch: 3.0,
             header: 15.0,
-            hover_fx: vec![],
+            lit: Lit::default(),
             group_fx: vec![],
-            group_lit: vec![],
             cam: (Rect::from_min_size(Pos2::ZERO, Vec2::splat(1.0)), Rect::from_min_size(Pos2::ZERO, Vec2::splat(1.0))),
             confirm: None,
             particles: vec![],
@@ -628,16 +651,26 @@ impl App {
 
     fn reset_nav(&mut self) {
         self.view = 0;
+        self.drop_layout(); // a new tree's versions start over: its keys could match old layouts
+        self.drop_history();
+        self.tiles.clear();
+        self.expanded.clear();
+        self.leaving = false;
+        self.left = false;
+    }
+
+    /// Lay out again from scratch, without a transition from the current tiles.
+    fn drop_layout(&mut self) {
+        self.layout_key.0 = u32::MAX;
+        self.built.clear();
+        self.anim = None;
+    }
+
+    /// Forget back / forward and the hovered item: they name dirs or files that may be gone.
+    fn drop_history(&mut self) {
         self.back.clear();
         self.fwd.clear();
         self.hover = None;
-        self.tiles.clear();
-        self.layout_key.0 = u32::MAX;
-        self.built.clear(); // a new tree's versions start over: its keys could match old layouts
-        self.expanded.clear();
-        self.anim = None;
-        self.leaving = false;
-        self.left = false;
     }
 
     /// Rescan only the current view (SpaceSniffer "refresh").
@@ -655,12 +688,10 @@ impl App {
         let path = t.path(Item::Dir(self.view));
         t.clear_dir(self.view);
         let next = t.dirs.len() as u32;
-        self.anim = None;
         // The old tiles index files that are gone, and the history can lead into orphaned dirs.
+        self.anim = None;
         self.tiles.clear();
-        self.hover = None;
-        self.back.clear();
-        self.fwd.clear();
+        self.drop_history();
         self.begin_scan(path, self.view, next);
     }
 
@@ -737,12 +768,8 @@ impl App {
         }
         t.remove(item);
         // File indices shift on delete: never morph across it.
-        self.layout_key.0 = u32::MAX;
-        self.built.clear();
-        self.anim = None;
-        self.back.clear();
-        self.fwd.clear();
-        self.hover = None;
+        self.drop_layout();
+        self.drop_history();
         if let Some(r) = self.tiles.iter().find(|x| x.item == item).map(|x| x.rect) {
             self.burst(r, col);
         }
@@ -827,8 +854,7 @@ impl App {
                 self.refresh_drives(ui.ctx());
                 // Zoom back out to it (the tree goes once that is done); nothing else acts meanwhile.
                 self.leaving = self.tree.is_some();
-                self.back.clear();
-                self.fwd.clear();
+                self.drop_history();
                 self.menu_item = None;
                 self.confirm = None;
                 self.particles.clear();
@@ -890,6 +916,8 @@ impl App {
     /// `ghost`: drawn over whatever else `ui` holds, at this opacity, during a zoom out of (into)
     /// it (see [`Chooser`]): its card only, no drives, no input.
     fn chooser(&mut self, ui: &mut egui::Ui, ghost: Option<f32>) -> Chooser {
+        // Where the treemap of a drive picked here will be (as `treemap` lays it out).
+        let area = field_rect(ui.available_rect_before_wrap().shrink(1.0), layout::grid(ui.ctx().pixels_per_point()));
         let mut child;
         let ui = match ghost {
             Some(a) => {
@@ -992,7 +1020,7 @@ impl App {
         if let Some(p) = go.filter(|_| ghost.is_none()) {
             self.start(&p);
             if self.tree.is_some() {
-                self.enter = Some(snap.clone());
+                self.enter(snap.clone(), area);
             }
         }
         snap
@@ -1012,13 +1040,11 @@ impl App {
             self.chooser(ui, None);
             return true;
         }
-        // The chooser, laid out (for where its drives are) and drawn as its card only, which fades
-        // in over the end of the zoom.
-        let k = self.anim.as_ref().filter(|_| self.left).and_then(|a| a.steps.last()).map_or(0.0, |s| s.k(now));
-        let card = ((k - (1.0 - CARD_FADE)) / CARD_FADE).clamp(0.0, 1.0);
+        // The chooser, laid out (for where its drives are) and drawn as its card only.
+        let card = self.card(now);
         let top = self.chooser(ui, Some(card));
         // The chooser's camera now (the top layer's), or of whatever transition this leaves from.
-        let cam = self.anim.as_ref().map_or((area, area), |a| *a.cams(area, now).last().unwrap());
+        let cam = Anim::cam_now(&self.anim, area, now);
         // Its widgets sit where it will come to rest: hit-test a click through where it is now.
         if self.left
             && let Some(click) = ui.input(|i| i.pointer.primary_clicked().then(|| i.pointer.interact_pos()).flatten()).filter(|&at| area.contains(at)).map(|at| apply(inverse(cam), at))
@@ -1028,7 +1054,7 @@ impl App {
             self.start(&drive);
             if !self.leaving {
                 // Started (a fresh tree): zoom into the drive from here.
-                self.enter = Some(Chooser { block: Some(top.blocks[i]), click, cam: Some(cam), card, ..top });
+                self.enter(Chooser { block: Some(top.blocks[i]), click, cam: Some(cam), card, ..top }, area);
                 return false;
             }
         }
@@ -1044,12 +1070,8 @@ impl App {
                 Some(b) => ((area, b), b.center(), b, true),
                 None => ((area, area), area.center(), area, false),
             };
-            let a = self.anim.get_or_insert_with(|| Anim { steps: vec![], v0: area });
-            a.v0 = view_after(cam, rel, area);
-            a.steps.push(Step { old, rel, local: false, anchor: None, t0: now, origin, rect, outside, at: None, chooser: None });
-            if a.steps.len() > gfx::MAX_WAVES {
-                a.steps.remove(0);
-            }
+            let lit = self.lit.clone();
+            Anim::push(&mut self.anim, cam, area, Step { old, rel, local: false, anchor: None, t0: now, origin, rect, outside, at: None, chooser: None, lit });
         }
         let a = self.anim.as_ref().unwrap();
         let cams = a.cams(area, now);
@@ -1060,6 +1082,29 @@ impl App {
         true
     }
 
+    /// Zoom out of chooser `c` into the scan just started from it, over `area` (the treemap's).
+    fn enter(&mut self, c: Chooser, area: Rect) {
+        let rel = (c.block.unwrap_or(area), area);
+        let (origin, cam) = (apply(rel, c.click), c.cam.unwrap_or((area, area)));
+        let step = Step { old: vec![], rel, local: false, anchor: None, t0: self.now(), origin, rect: area, outside: false, at: None, chooser: Some(c), lit: Lit::default() };
+        Anim::push(&mut self.anim, cam, area, step);
+    }
+
+    /// Opacity of the chooser's card (heading, path row) during a zoom out of it (it fades away
+    /// over the start, from where it was when the drive was picked) or back to it (it fades in
+    /// over the end; none until that zoom starts).
+    fn card(&self, now: f32) -> f32 {
+        let Some(a) = &self.anim else { return 0.0 };
+        if self.leaving {
+            let k = a.steps.last().filter(|_| self.left).map_or(0.0, |s| s.k(now));
+            return ((k - (1.0 - CARD_FADE)) / CARD_FADE).clamp(0.0, 1.0);
+        }
+        match a.steps.first() {
+            Some(s @ Step { chooser: Some(c), .. }) => c.card * (1.0 - s.k(now) / CARD_FADE).max(0.0),
+            _ => 0.0,
+        }
+    }
+
     fn treemap(&mut self, ui: &mut egui::Ui) {
         let (area, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click());
         let pitch = layout::grid(ui.ctx().pixels_per_point());
@@ -1067,9 +1112,11 @@ impl App {
             // DPI changed (e.g. moved to another monitor): the lattice moved, relayout from scratch.
             self.pitch = pitch;
             self.header = layout::header(pitch);
-            self.layout_key.0 = u32::MAX;
-            self.built.clear();
-            self.anim = None;
+            // Not before a first layout (the default pitch on a scan's first frame): nothing to
+            // drop, and its transition is the zoom out of the chooser.
+            if self.layout_key.0 != u32::MAX {
+                self.drop_layout();
+            }
         }
         let area = field_rect(area.shrink(1.0), pitch);
         let now = self.now();
@@ -1080,9 +1127,8 @@ impl App {
         // Clicks are handled before the relayout below so the transition starts this very frame.
         // Hit-testing uses the target layout, seen through its current camera, so hover and clicks
         // track what is on screen mid-transition.
-        let (cf, ct) = self.cam;
         let hit = resp.hover_pos().and_then(|p| {
-            let p = cf.min + (p - ct.min) * (cf.size() / ct.size());
+            let p = apply(inverse(self.cam), p);
             self.tiles.iter().rev().find(|x| x.rect.contains(p)).map(|x| (x, p))
         });
         let hover = hit.map(|(x, _)| x.item);
@@ -1123,10 +1169,11 @@ impl App {
             let structural = key.0 != prev.0 || key.1 != prev.1 || key.3 != prev.3;
             // Relayout costs ~0.2 ms: follow the scan every frame so new tiles grow smoothly.
             if structural || key.2 != prev.2 {
+                let lit = self.lit.clone();
                 if key.0 != prev.0 {
                     // New view: drop hover afterglow. A lit folder's rect is looked up in the current
                     // layout, so the folder just entered (now the whole view) would light everything.
-                    self.hover_fx.clear();
+                    self.lit.tiles.clear();
                     self.group_fx.clear();
                 }
                 let old = std::mem::take(&mut self.tiles);
@@ -1150,7 +1197,7 @@ impl App {
                     let (from, to) = (prev.0, self.view);
                     // The old layout's camera right now (mid-transition it is still moving), and the
                     // click in that layout's coords.
-                    let cam = self.anim.as_ref().map_or((area, area), |a| *a.cams(area, now).last().unwrap());
+                    let cam = Anim::cam_now(&self.anim, area, now);
                     let click = self.click_pos.take().map(|p| apply(inverse(cam), p));
                     let toggled = self.toggled.take();
                     let whole = (area, area);
@@ -1173,25 +1220,12 @@ impl App {
                     } else {
                         (whole, area.center(), area, false, None)
                     };
-                    let a = self.anim.get_or_insert_with(|| Anim { steps: vec![], v0: area });
-                    a.v0 = view_after(cam, rel, area);
                     let local = from == to;
-                    let at = (local || a.steps.last().is_some_and(|s| s.local)).then(|| index(&old));
-                    a.steps.push(Step { old, rel, local, anchor, t0: now, origin, rect, outside, at, chooser: None });
-                    if a.steps.len() > gfx::MAX_WAVES {
-                        a.steps.remove(0); // shortcut: the oldest layer flips at once; needs 5 clicks inside one transition
-                    }
-                } else if structural {
+                    let at = (local || self.anim.as_ref().and_then(|a| a.steps.last()).is_some_and(|s| s.local)).then(|| index(&old));
+                    Anim::push(&mut self.anim, cam, area, Step { old, rel, local, anchor, t0: now, origin, rect, outside, at, chooser: None, lit });
+                } else if structural && prev.0 != u32::MAX {
+                    // (A first layout keeps its transition: the zoom out of the chooser, see `enter`.)
                     self.anim = None;
-                }
-                // A scan's first layout: zoom into it out of the chooser (from the picked drive).
-                if prev.0 == u32::MAX
-                    && let Some(c) = self.enter.take()
-                {
-                    let rel = (c.block.unwrap_or(area), area);
-                    let (origin, v0) = (apply(rel, c.click), view_after(c.cam.unwrap_or((area, area)), rel, area));
-                    let step = Step { old: vec![], rel, local: false, anchor: None, t0: now, origin, rect: area, outside: false, at: None, chooser: Some(c) };
-                    self.anim = Some(Anim { steps: vec![step], v0 });
                 }
                 self.layout_key = key;
             }
@@ -1213,8 +1247,8 @@ impl App {
         // Hover brightness eases in/out over HOVER_SECS; tiles just left keep a short afterglow.
         let step = ui.input(|i| i.stable_dt).min(0.1) / HOVER_SECS;
         let tiles = &self.tiles;
-        ease_hover(&mut self.hover_fx, &mut self.group_fx, lit, group, step, |it| tiles.iter().find(|x| x.item == it).map(|x| x.rect));
-        self.group_lit = self.group_fx.iter().filter_map(|&(g, v)| Some((tiles.iter().find(|x| x.item == g)?.rect, v * v * (3.0 - 2.0 * v)))).collect();
+        ease_hover(&mut self.lit.tiles, &mut self.group_fx, lit, group, step, |it| tiles.iter().find(|x| x.item == it).map(|x| x.rect));
+        self.lit.groups = self.group_fx.iter().filter_map(|&(g, v)| Some((tiles.iter().find(|x| x.item == g)?.rect, v * v * (3.0 - 2.0 * v)))).collect();
 
         let t = self.tree.as_ref().unwrap();
         let mut insts = Vec::with_capacity(self.tiles.len() * 2 + 8);
@@ -1344,19 +1378,19 @@ impl App {
                 }
                 // A step's shared title is drawn once, by the layer it leads to, untouched by its wave.
                 let label = if hi < n && steps[hi].anchor == Some(x.item) { None } else { Some(j > 0 && steps[j - 1].anchor == Some(x.item)) };
-                self.draw(t, x, cams[j], area, (j, hi), hi == n, label, insts, labels);
+                self.draw(t, x, cams[j], area, (j, hi), if hi < n { &steps[hi].lit } else { &self.lit }, label, insts, labels);
             }
         }
     }
 
-    /// One tile, camera-mapped, belonging to layers `lo..=hi`; `top`: of the current layout (the
-    /// only one hover applies to: lit rects are in its coords); `label`: none, or whether it is
+    /// One tile, camera-mapped, belonging to layers `lo..=hi`; `lit`: the hover light of layer `hi`
+    /// (its rects in that layer's coords), the one it shows until a wave flips it; `label`: none, or whether it is
     /// fixed (see [`Label`]). Label visibility is decided in layout space so the camera never makes
     /// labels pop. Tolerates stale items. Only what covers a dot cell's centre inside `area` is
     /// drawn (the field is one texel per cell, see gfx.rs): the thousands of specks of a layer
     /// zoomed away, or pushed off screen, cost nothing.
     #[allow(clippy::too_many_arguments)]
-    fn draw(&self, t: &Tree, tile: &Tile, cam: Map, area: Rect, (lo, hi): (usize, usize), top: bool, label: Option<bool>, insts: &mut Vec<Inst>, labels: &mut Vec<Label>) {
+    fn draw(&self, t: &Tree, tile: &Tile, cam: Map, area: Rect, (lo, hi): (usize, usize), lit: &Lit, label: Option<bool>, insts: &mut Vec<Inst>, labels: &mut Vec<Label>) {
         let r = apply_rect(cam, tile.rect);
         let v = r.intersect(area);
         let p = self.pitch;
@@ -1368,14 +1402,11 @@ impl App {
         let item = tile.item;
         let is_dir = matches!(item, Item::Dir(_));
         let col = if is_dir { FOLDER_RGB } else { CATS[tile.cat as usize].1 };
-        let mut hov = 0.0;
-        if top {
-            hov = self.hover_fx.iter().find(|x| x.0 == item).map_or(0.0, |x| x.1 * x.1 * (3.0 - 2.0 * x.1));
-            // Inside a lit folder (its rect strictly contains ours): lit the same way.
-            for &(g, v) in &self.group_lit {
-                if g != tile.rect && g.contains_rect(tile.rect) {
-                    hov = hov.max(v);
-                }
+        let mut hov = lit.tiles.iter().find(|x| x.0 == item).map_or(0.0, |x| x.1 * x.1 * (3.0 - 2.0 * x.1));
+        // Inside a lit folder (its rect strictly contains ours): lit the same way.
+        for &(g, v) in &lit.groups {
+            if g != tile.rect && g.contains_rect(tile.rect) {
+                hov = hov.max(v);
             }
         }
         let flags = gfx::FIELD | if tile.solid { gfx::SOLID } else { 0 } | if tile.open { gfx::OPEN } else { 0 };
@@ -1572,14 +1603,9 @@ impl eframe::App for App {
                     return;
                 }
                 // Just left the chooser: its card fades over the start of the zoom out of it.
-                let now = self.now();
-                let card = match (&self.enter, self.anim.as_ref().and_then(|a| a.steps.first())) {
-                    (Some(c), _) => Some(c.card),
-                    (_, Some(s @ Step { chooser: Some(c), .. })) => Some(c.card * (1.0 - s.k(now) / CARD_FADE)),
-                    _ => None,
-                };
-                if let Some(a) = card.filter(|&a| a > 0.0) {
-                    self.chooser(ui, Some(a));
+                let card = self.card(self.now());
+                if card > 0.0 {
+                    self.chooser(ui, Some(card));
                 }
                 {
                     let _s = perf::span("treemap");
@@ -1594,7 +1620,7 @@ impl eframe::App for App {
         self.cpu_ms = self.cpu_ms * 0.9 + frame_t0.elapsed().as_secs_f32() * 1000.0 * 0.1;
         perf::frame(frame_t0.elapsed().as_secs_f64() * 1e3);
         // The pixel field is static: keep drawing only while something moves (input repaints anyway).
-        let easing = self.hover_fx.iter().chain(&self.group_fx).any(|x| x.1 < 1.0);
+        let easing = self.lit.tiles.iter().chain(&self.group_fx).any(|x| x.1 < 1.0);
         let busy = self.scan.is_some() || self.anim.is_some() || !self.particles.is_empty() || easing;
         if busy {
             if minimized {
