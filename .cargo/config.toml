@@ -1,8 +1,8 @@
 # Single self-contained exe: link the C runtime statically.
-# x86-64-v2 (SSE4.2/POPCNT, required by Windows 11 24H2 anyway): egui's rasteriser (fearless_simd)
-# then skips its scalar fallback copy. Not v3: AVX2 is missing on some Pentium/Celeron parts.
+# x86-64-v3 (AVX2/FMA/BMI2; Haswell / Zen and later): egui's rasteriser (fearless_simd) then keeps
+# only its AVX2 path. Won't start on CPUs without AVX2 (older Pentium/Celeron/Atom).
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static", "-C", "target-cpu=x86-64-v2"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "target-cpu=x86-64-v3"]
 
 [target.x86_64-pc-windows-gnu]
-rustflags = ["-C", "target-feature=+crt-static", "-C", "target-cpu=x86-64-v2"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "target-cpu=x86-64-v3"]
