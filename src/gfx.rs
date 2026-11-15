@@ -107,20 +107,14 @@ fn slot(dev: &wgpu::Device, bgl: &wgpu::BindGroupLayout) -> Slot {
 
 pub fn init(rs: &RenderState) {
     let dev = &rs.device;
-    let shader = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("pixel"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-    });
+    let shader =
+        dev.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("pixel"), source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()) });
     let bgl = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: None,
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
             count: None,
         }],
     });
@@ -137,11 +131,7 @@ pub fn init(rs: &RenderState) {
             count: None,
         }],
     });
-    let layout = dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: None,
-        bind_group_layouts: &[Some(&bgl)],
-        immediate_size: 0,
-    });
+    let layout = dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
     let target = Some(wgpu::ColorTargetState {
         format: rs.target_format,
         blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
@@ -180,12 +170,7 @@ pub fn init(rs: &RenderState) {
                 attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Unorm8x4, 2 => Uint8x4, 3 => Unorm8x4],
             })],
         },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs"),
-            compilation_options: Default::default(),
-            targets: &[target],
-        }),
+        fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), compilation_options: Default::default(), targets: &[target] }),
         primitive: Default::default(),
         depth_stencil: None,
         multisample: Default::default(),

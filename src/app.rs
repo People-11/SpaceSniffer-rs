@@ -3,10 +3,7 @@ use crate::layout::{self, Tile};
 use crate::perf;
 use crate::tree::{self, CATS, Item, ItemMap, Tree};
 use crate::win;
-use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontId, Key, Margin, PointerButton, Pos2, Rect, RichText, Sense, Vec2,
-    pos2, vec2,
-};
+use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Key, Margin, PointerButton, Pos2, Rect, RichText, Sense, Vec2, pos2, vec2};
 use eframe::egui_wgpu::SurfaceConfig;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -101,7 +98,14 @@ fn place(t: &Tree, tiles: &[Tile], view: u32, area: Rect, expanded: &HashSet<u32
 /// - an entry inside the folder now being lit keeps rising until that folder has caught up with
 ///   it (its tiles are about to be lit by that folder anyway), then fades unseen beneath it;
 /// - what is lit is never dimmer than the lit folders around it, so it starts from their level.
-fn ease_hover(direct: &mut Vec<(Item, f32)>, groups: &mut Vec<(Item, f32)>, lit: [Option<Item>; 2], group: Option<Item>, step: f32, rect_of: impl Fn(Item) -> Option<Rect>) {
+fn ease_hover(
+    direct: &mut Vec<(Item, f32)>,
+    groups: &mut Vec<(Item, f32)>,
+    lit: [Option<Item>; 2],
+    group: Option<Item>,
+    step: f32,
+    rect_of: impl Fn(Item) -> Option<Rect>,
+) {
     let inside = |it: Item, outer: Rect| rect_of(it).is_some_and(|r| r != outer && outer.contains_rect(r));
     // Inherit first, from the levels as they were shown last frame, then move everything a step.
     for h in lit.into_iter().flatten() {
@@ -574,7 +578,6 @@ pub struct App {
     rng: u64,
     t0: Instant,
     path_input: String,
-    /// Drive roots with their (total, free) bytes, if read.
     drives: Vec<Drive>,
     /// Their bytes as each is read (see [`App::refresh_drives`]).
     drives_rx: Option<std::sync::mpsc::Receiver<Drive>>,
@@ -924,11 +927,10 @@ impl App {
                 self.scan = None;
                 self.status = "Stopped".into();
             }
-            // Breadcrumb, right aligned, deepest last.
             if let Some(t) = &self.tree {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Deepest first, as far up as there is room left of it ("…" for the rest); the
-                    // current folder itself is cut short if even it does not fit.
+                    // Breadcrumb, right aligned: the current folder (rightmost) first, then up as far as
+                    // there is room ("…" for the rest); the current one itself is cut short if need be.
                     let font = egui::TextStyle::Button.resolve(ui.style());
                     let mut d = self.view;
                     loop {
@@ -1091,7 +1093,10 @@ impl App {
         let cam = from[0];
         // Its widgets sit where it will come to rest: hit-test a click through where it is now.
         if self.left
-            && let Some(click) = ui.input(|i| i.pointer.primary_clicked().then(|| i.pointer.interact_pos()).flatten()).filter(|&at| area.contains(at)).map(|at| apply(inverse(cam), at))
+            && let Some(click) = ui
+                .input(|i| i.pointer.primary_clicked().then(|| i.pointer.interact_pos()).flatten())
+                .filter(|&at| area.contains(at))
+                .map(|at| apply(inverse(cam), at))
             && let Some(i) = top.blocks.iter().position(|b| b.contains(click))
         {
             let drive = self.drives[i].0.clone();
@@ -1131,7 +1136,8 @@ impl App {
         let rel = (c.block.unwrap_or(area), area);
         let (origin, from) = (apply(rel, c.click), c.cam.unwrap_or([(area, area); 2]));
         let now = self.now();
-        let step = Step { old: vec![], rel, local: false, anchor: None, t0: now, origin, rect: area, outside: false, at: None, chooser: Some(c), lit: Lit::default() };
+        let step =
+            Step { old: vec![], rel, local: false, anchor: None, t0: now, origin, rect: area, outside: false, at: None, chooser: Some(c), lit: Lit::default() };
         Anim::push(&mut self.anim, from, area, step);
     }
 
@@ -1270,7 +1276,6 @@ impl App {
                     let at = (local || self.anim.as_ref().and_then(|a| a.steps.last()).is_some_and(|s| s.local)).then(|| index(&old));
                     Anim::push(&mut self.anim, motion, area, Step { old, rel, local, anchor, t0: now, origin, rect, outside, at, chooser: None, lit });
                 } else if structural && prev.0 != u32::MAX {
-                    // (A first layout keeps its transition: the zoom out of the chooser, see `enter`.)
                     self.anim = None;
                 }
                 self.layout_key = key;
@@ -1317,7 +1322,6 @@ impl App {
         self.cam = *cams.last().unwrap();
         paint_field(ui, area, insts, labels, &waves);
 
-        // Interaction.
         // Own tooltip instead of egui's: shown at once and kept up while the tiles change under a
         // still pointer (egui's waits for movement after a click / relayout).
         if let (Some(item), Some(at)) = (self.hover, resp.hover_pos())
@@ -1331,17 +1335,16 @@ impl App {
                     (&x.name, CATS[x.cat as usize].0.to_string())
                 }
             };
-            egui::Area::new(egui::Id::unique("tile_tip"))
-                .order(egui::Order::Tooltip)
-                .fixed_pos((at + vec2(14.0, 18.0)).round())
-                .interactable(false)
-                .show(ui.ctx(), |ui| {
+            egui::Area::new(egui::Id::unique("tile_tip")).order(egui::Order::Tooltip).fixed_pos((at + vec2(14.0, 18.0)).round()).interactable(false).show(
+                ui.ctx(),
+                |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                         ui.label(RichText::new(&**name).strong());
                         ui.label(format!("{}  ·  {}", fmt_size(size), extra));
                     });
-                });
+                },
+            );
         }
         if resp.secondary_clicked() {
             self.menu_item = hover;
@@ -1390,8 +1393,7 @@ impl App {
 
     /// Draw the layer stack: layer j (`steps[j].old`, the top one the current tiles) under camera
     /// `cams[j]`. A tile an expand/collapse left unchanged belongs to both layers around it: drawn
-    /// once, untouched by that wave.
-    /// `chooser_top`: the chooser is the top layer (leaving), over `self.tiles` (moved into the last step).
+    /// once, untouched by that wave. `chooser_top`: the chooser is the top layer (leaving).
     #[allow(clippy::too_many_arguments)]
     fn layers(&self, t: &Tree, steps: &[Step], cams: &[Map], area: Rect, chooser_top: Option<&Chooser>, insts: &mut Vec<Inst>, labels: &mut Vec<Label>) {
         let n = steps.len();
@@ -1411,7 +1413,18 @@ impl App {
                 for (strip, text) in &c.titles {
                     let r = apply_rect(cam, *strip);
                     let pos = pos2(r.min.x + 4.0, r.center().y);
-                    labels.push(Label { lo: j, hi: j, fixed: false, clip: r, pos, text: text.clone(), sub: String::new(), room: Vec2::ZERO, size: 12.0, inst: 0 });
+                    labels.push(Label {
+                        lo: j,
+                        hi: j,
+                        fixed: false,
+                        clip: r,
+                        pos,
+                        text: text.clone(),
+                        sub: String::new(),
+                        room: Vec2::ZERO,
+                        size: 12.0,
+                        inst: 0,
+                    });
                 }
             }
             for x in layer(j) {
@@ -1429,14 +1442,24 @@ impl App {
         }
     }
 
-    /// One tile, camera-mapped, belonging to layers `lo..=hi`; `lit`: the hover light of layer `hi`
-    /// (its rects in that layer's coords), the one it shows until a wave flips it; `label`: none, or whether it is
-    /// fixed (see [`Label`]). Label visibility is decided in layout space so the camera never makes
-    /// labels pop. Tolerates stale items. Only what covers a dot cell's centre inside `area` is
-    /// drawn (the field is one texel per cell, see gfx.rs): the thousands of specks of a layer
-    /// zoomed away, or pushed off screen, cost nothing.
+    /// One tile, camera-mapped, belonging to layers `lo..=hi`, lit as layer `hi` was (shown until a
+    /// wave flips it); `label`: none, or whether it is fixed (see [`Label`]). Label fit is decided in
+    /// layout space so zooms never make labels pop. Tolerates stale items. Only what covers a dot
+    /// cell's centre inside `area` is drawn (one texel per cell, see gfx.rs): the specks of a layer
+    /// zoomed away cost nothing.
     #[allow(clippy::too_many_arguments)]
-    fn draw(&self, t: &Tree, tile: &Tile, cam: Map, area: Rect, (lo, hi): (usize, usize), lit: &Lit, label: Option<bool>, insts: &mut Vec<Inst>, labels: &mut Vec<Label>) {
+    fn draw(
+        &self,
+        t: &Tree,
+        tile: &Tile,
+        cam: Map,
+        area: Rect,
+        (lo, hi): (usize, usize),
+        lit: &Lit,
+        label: Option<bool>,
+        insts: &mut Vec<Inst>,
+        labels: &mut Vec<Label>,
+    ) {
         let r = apply_rect(cam, tile.rect);
         let v = r.intersect(area);
         let p = self.pitch;
@@ -1616,50 +1639,44 @@ impl eframe::App for App {
         }
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
 
-        egui::Panel::top("toolbar")
-            .frame(egui::Frame::NONE.fill(BG).inner_margin(Margin::symmetric(10, 6)))
-            .show(ui, |ui| {
-                let _s = perf::span("toolbar");
-                self.toolbar(ui)
-            });
+        egui::Panel::top("toolbar").frame(egui::Frame::NONE.fill(BG).inner_margin(Margin::symmetric(10, 6))).show(ui, |ui| {
+            let _s = perf::span("toolbar");
+            self.toolbar(ui)
+        });
 
-        egui::Panel::bottom("status")
-            .frame(egui::Frame::NONE.fill(BG).inner_margin(Margin::symmetric(12, 4)))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let dot = if self.scan.is_some() { c32(5) } else { c32(1) };
-                    ui.label(RichText::new("●").color(dot));
-                    ui.label(RichText::new(&self.status).color(TEXT_DIM));
-                    if let Some(t) = &self.tree {
-                        let v = &t.dirs[self.view as usize];
-                        ui.label(RichText::new(format!("{} · {} files", fmt_size(v.size), v.nfiles)).color(TEXT_DIM));
-                    }
-                    ui.label(RichText::new(format!("{} · {} fps · {:.1} ms", self.gpu_info, self.frames.len(), self.cpu_ms)).color(TEXT_DIM.gamma_multiply(0.6)));
-                });
+        egui::Panel::bottom("status").frame(egui::Frame::NONE.fill(BG).inner_margin(Margin::symmetric(12, 4))).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let dot = if self.scan.is_some() { c32(5) } else { c32(1) };
+                ui.label(RichText::new("●").color(dot));
+                ui.label(RichText::new(&self.status).color(TEXT_DIM));
+                if let Some(t) = &self.tree {
+                    let v = &t.dirs[self.view as usize];
+                    ui.label(RichText::new(format!("{} · {} files", fmt_size(v.size), v.nfiles)).color(TEXT_DIM));
+                }
+                ui.label(RichText::new(format!("{} · {} fps · {:.1} ms", self.gpu_info, self.frames.len(), self.cpu_ms)).color(TEXT_DIM.gamma_multiply(0.6)));
             });
+        });
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(BG).inner_margin(Margin { left: 10, right: 10, top: 2, bottom: 4 }))
-            .show(ui, |ui| {
-                if self.tree.is_none() {
-                    self.chooser(ui, None);
-                    return;
-                }
-                if self.leaving && self.leave(ui) {
-                    return;
-                }
-                // Just left the chooser: its card fades over the start of the zoom out of it.
-                let card = self.card(self.now());
-                if card > 0.0 {
-                    self.chooser(ui, Some(card));
-                }
-                {
-                    let _s = perf::span("treemap");
-                    self.treemap(ui);
-                }
-                let parts = self.step_particles(dt);
-                gfx::paint(ui.painter(), ui.clip_rect(), parts, 2, &[]);
-            });
+        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(BG).inner_margin(Margin { left: 10, right: 10, top: 2, bottom: 4 })).show(ui, |ui| {
+            if self.tree.is_none() {
+                self.chooser(ui, None);
+                return;
+            }
+            if self.leaving && self.leave(ui) {
+                return;
+            }
+            // Just left the chooser: its card fades over the start of the zoom out of it.
+            let card = self.card(self.now());
+            if card > 0.0 {
+                self.chooser(ui, Some(card));
+            }
+            {
+                let _s = perf::span("treemap");
+                self.treemap(ui);
+            }
+            let parts = self.step_particles(dt);
+            gfx::paint(ui.painter(), ui.clip_rect(), parts, 2, &[]);
+        });
 
         self.delete_modal(&ctx);
 
@@ -1724,68 +1741,57 @@ mod tests {
         assert_eq!(shown(&[-1.0, 0.0], 1, 1, true).1, 0.0);
     }
 
-    /// Interrupting a zoom never makes anything jump: zoom into a child, then halfway back out
-    /// (and in again), and every layer stays where it was on screen at the moment of the switch.
-    /// Each zoom still ends at rest.
+    /// Zoom into a child, back out at 0.2 s, in again at 0.4 s: nothing jumps (every layer stays
+    /// where it was on screen), the view keeps its velocity, comes to a stop the way every zoom
+    /// ends before it turns, and ends at rest.
     #[test]
-    fn interrupted_zooms_continue_from_the_screen() {
+    fn interrupted_zooms() {
         let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
         let small = Rect::from_min_size(pos2(500.0, 100.0), vec2(200.0, 100.0)); // child's tile in the parent
         let tile = Rect::from_min_size(pos2(520.0, 120.0), vec2(30.0, 20.0)); // a tile in the parent
         let close = |a: Rect, b: Rect| (a.min - b.min).length() + (a.max - b.max).length() < 1e-2;
-        let rest = (area, area);
-        // Zoom in from rest (parent -> child); at rest nothing moves.
-        let rel_in = (small, area);
-        let v0 = view_after(rest, rel_in, area);
-        assert!(close(apply_rect(then(rel_in, top_cam(v0, area, 0.0)), tile), tile));
-        assert!(close(top_cam(v0, area, 1.0).0, area) && close(top_cam(v0, area, 1.0).1, area));
-        let cam_child = top_cam(v0, area, ease(0.4));
-        let on_screen = apply_rect(then(rel_in, cam_child), tile);
-        // Back out (child -> parent) at 40 %: the parent tile is still where it was.
-        let rel_out = (area, small);
-        let v1 = view_after(cam_child, rel_out, area);
-        let cam_parent = top_cam(v1, area, 0.0);
-        assert!(close(apply_rect(cam_parent, tile), on_screen));
-        // ... and the child layer under it too (it follows through `rel_out`).
-        assert!(close(apply_rect(then(rel_out, cam_parent), area), apply_rect(cam_child, area)));
-        let mid = top_cam(v1, area, ease(0.3));
-        // Forward again at 30 % of the way back.
-        let v2 = view_after(mid, rel_in, area);
-        assert!(close(apply_rect(then(rel_in, top_cam(v2, area, 0.0)), tile), apply_rect(mid, tile)));
-        let end = top_cam(v2, area, 1.0);
-        assert!(close(end.0, area) && close(end.1, area));
-    }
-
-    /// A zoom interrupted by one the other way: the view keeps its velocity at the switch, comes
-    /// to a stop the way every zoom ends, turns, and still comes to rest exactly.
-    #[test]
-    fn interrupted_zoom_keeps_its_velocity() {
-        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
-        let small = Rect::from_min_size(pos2(500.0, 100.0), vec2(200.0, 100.0));
-        let step = |rel: Map, t0: f32| Step { old: vec![], rel, local: false, anchor: None, t0, origin: Pos2::ZERO, rect: area, outside: false, at: None, chooser: None, lit: Lit::default() };
+        let step = |rel: Map, t0: f32| Step {
+            old: vec![],
+            rel,
+            local: false,
+            anchor: None,
+            t0,
+            origin: Pos2::ZERO,
+            rect: area,
+            outside: false,
+            at: None,
+            chooser: None,
+            lit: Lit::default(),
+        };
+        let (rel_in, rel_out, h) = ((small, area), (area, small), 1e-3);
         let mut anim = None;
-        Anim::push(&mut anim, [(area, area); 2], area, step((small, area), 0.0));
+        Anim::push(&mut anim, [(area, area); 2], area, step(rel_in, 0.0));
         assert_eq!(anim.as_ref().unwrap().coast, [0.0; 4], "from rest: no coast");
-        let (t, h) = (0.2, 1e-3);
-        let rel = (area, small);
-        // View of the parent (the new top layout) under the zoom in, just before the switch.
-        let before = |t| params(view_after(Anim::cam_now(&anim, area, t), rel, area));
-        let (v1, v0) = (before(t), before(t - h));
+        let cams = |a: &Option<Anim>, t| a.as_ref().unwrap().cams(area, t);
+        assert!(close(apply_rect(cams(&anim, 0.0)[0], tile), tile), "starts where it is");
+        // Back out: the parent's tile and the child layer stay put, the parent's view (the new
+        // top layout) keeps its velocity.
+        let t = 0.2;
+        let parent = |a: &Option<Anim>, t| params(view_after(Anim::cam_now(a, area, t), rel_out, area));
+        let (p0, p1) = (parent(&anim, t - h), parent(&anim, t));
+        let (tile_at, child_at) = (apply_rect(cams(&anim, t)[0], tile), apply_rect(cams(&anim, t)[1], area));
         let from = Anim::motion(&anim, area, t);
-        Anim::push(&mut anim, from, area, step(rel, t));
-        let after = |t| params(apply_rect(inverse(Anim::cam_now(&anim, area, t)), area));
-        let v2 = after(t + h);
+        Anim::push(&mut anim, from, area, step(rel_out, t));
+        assert!(close(apply_rect(cams(&anim, t)[2], tile), tile_at) && close(apply_rect(cams(&anim, t)[1], area), child_at));
+        let view = |a: &Option<Anim>, t| params(apply_rect(inverse(Anim::cam_now(a, area, t)), area));
+        let (v1, c0, c1) = (view(&anim, t + h), view(&anim, t + HOVER_SECS - h), view(&anim, t + HOVER_SECS));
         for i in 0..4 {
-            let (a, b) = ((v1[i] - v0[i]) / h, (v2[i] - v1[i]) / h);
+            let (a, b) = ((p1[i] - p0[i]) / h, (v1[i] - p1[i]) / h);
             assert!((a - b).abs() <= 0.05 * a.abs().max(1.0), "param {i}: {a} -> {b}");
-            assert!((after(t)[i] - v1[i]).abs() < 1e-3, "no jump");
-            // Still for a moment where the coast ends, before the zoom back sets off.
-            let (c0, c1) = (after(t + HOVER_SECS - h), after(t + HOVER_SECS));
-            assert!((c1[i] - c0[i]).abs() / h <= 0.05 * a.abs().max(1.0), "param {i} stops");
+            assert!((c1[i] - c0[i]).abs() / h <= 0.05 * a.abs().max(1.0), "param {i} stops before turning");
         }
-        let end = Anim::cam_now(&anim, area, t + ZOOM_SECS);
-        let r = apply_rect(end, area);
-        assert!((r.min - area.min).length() + (r.max - area.max).length() < 1e-2, "ends at rest: {end:?}");
+        // In again: the parent's tile stays put; it all ends at rest.
+        let t = 0.4;
+        let tile_at = apply_rect(cams(&anim, t)[2], tile);
+        let from = Anim::motion(&anim, area, t);
+        Anim::push(&mut anim, from, area, step(rel_in, t));
+        assert!(close(apply_rect(cams(&anim, t)[2], tile), tile_at));
+        assert!(close(apply_rect(Anim::cam_now(&anim, area, t + ZOOM_SECS), area), area), "ends at rest");
     }
 
     /// Root (1) > mid (2) > inner (3) title strips: whichever way and however fast the pointer
@@ -1816,7 +1822,8 @@ mod tests {
         ];
         for (path, dwell, watch) in cases {
             let (mut direct, mut groups) = (vec![], vec![]);
-            let frame = |g: u32, direct: &mut Vec<_>, groups: &mut Vec<_>| ease_hover(direct, groups, [Some(Item::Dir(g)), None], Some(Item::Dir(g)), step, rect_of);
+            let frame =
+                |g: u32, direct: &mut Vec<_>, groups: &mut Vec<_>| ease_hover(direct, groups, [Some(Item::Dir(g)), None], Some(Item::Dir(g)), step, rect_of);
             (0..20).for_each(|_| frame(path[0], &mut direct, &mut groups)); // first title fully lit
             let mut last: Vec<f32> = watch.iter().map(|&t| level(t, &direct, &groups)).collect();
             let frames = path[1..].iter().enumerate().flat_map(|(i, &g)| std::iter::repeat_n(g, if i + 2 == path.len() { 20 } else { dwell }));

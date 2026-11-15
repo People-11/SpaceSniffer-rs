@@ -34,26 +34,19 @@ pub fn category(name: &str) -> u8 {
         *b = c.to_ascii_lowercase();
     }
     match &buf[..ext.len()] {
-        b"exe" | b"dll" | b"msi" | b"msix" | b"appx" | b"apk" | b"jar" | b"pak" | b"vpk" | b"asar"
-        | b"ocx" | b"node" | b"so" | b"dylib" | b"bundle" => 0,
-        b"rs" | b"c" | b"h" | b"cpp" | b"hpp" | b"cc" | b"cs" | b"go" | b"py" | b"pyc" | b"js"
-        | b"mjs" | b"ts" | b"tsx" | b"jsx" | b"java" | b"class" | b"kt" | b"swift" | b"rlib"
-        | b"rmeta" | b"o" | b"obj" | b"a" | b"lib" | b"pdb" | b"ilk" | b"json" | b"toml"
-        | b"yaml" | b"yml" | b"xml" | b"lock" | b"wasm" | b"d" | b"map" | b"sh" | b"ps1"
-        | b"bat" | b"lua" | b"css" | b"html" | b"vue" | b"pack" | b"idx" => 1,
-        b"jpg" | b"jpeg" | b"png" | b"gif" | b"bmp" | b"webp" | b"heic" | b"tif" | b"tiff"
-        | b"psd" | b"raw" | b"cr2" | b"nef" | b"arw" | b"dng" | b"svg" | b"ico" | b"avif" => 2,
-        b"mp4" | b"mkv" | b"avi" | b"mov" | b"wmv" | b"flv" | b"webm" | b"m4v" | b"ts2" | b"mts"
-        | b"m2ts" | b"vob" | b"prproj" | b"aep" => 3,
-        b"pdf" | b"doc" | b"docx" | b"xls" | b"xlsx" | b"ppt" | b"pptx" | b"txt" | b"md"
-        | b"rtf" | b"odt" | b"epub" | b"csv" | b"chm" => 4,
+        b"exe" | b"dll" | b"msi" | b"msix" | b"appx" | b"apk" | b"jar" | b"pak" | b"vpk" | b"asar" | b"ocx" | b"node" | b"so" | b"dylib" | b"bundle" => 0,
+        b"rs" | b"c" | b"h" | b"cpp" | b"hpp" | b"cc" | b"cs" | b"go" | b"py" | b"pyc" | b"js" | b"mjs" | b"ts" | b"tsx" | b"jsx" | b"java" | b"class"
+        | b"kt" | b"swift" | b"rlib" | b"rmeta" | b"o" | b"obj" | b"a" | b"lib" | b"pdb" | b"ilk" | b"json" | b"toml" | b"yaml" | b"yml" | b"xml" | b"lock"
+        | b"wasm" | b"d" | b"map" | b"sh" | b"ps1" | b"bat" | b"lua" | b"css" | b"html" | b"vue" | b"pack" | b"idx" => 1,
+        b"jpg" | b"jpeg" | b"png" | b"gif" | b"bmp" | b"webp" | b"heic" | b"tif" | b"tiff" | b"psd" | b"raw" | b"cr2" | b"nef" | b"arw" | b"dng" | b"svg"
+        | b"ico" | b"avif" => 2,
+        b"mp4" | b"mkv" | b"avi" | b"mov" | b"wmv" | b"flv" | b"webm" | b"m4v" | b"ts2" | b"mts" | b"m2ts" | b"vob" | b"prproj" | b"aep" => 3,
+        b"pdf" | b"doc" | b"docx" | b"xls" | b"xlsx" | b"ppt" | b"pptx" | b"txt" | b"md" | b"rtf" | b"odt" | b"epub" | b"csv" | b"chm" => 4,
         b"mp3" | b"flac" | b"wav" | b"aac" | b"ogg" | b"m4a" | b"wma" | b"opus" | b"ape" => 5,
-        b"zip" | b"7z" | b"rar" | b"tar" | b"gz" | b"xz" | b"zst" | b"bz2" | b"iso" | b"img"
-        | b"cab" | b"cache" | b"vhd" | b"vhdx" | b"vmdk" | b"vdi" | b"ova" | b"qcow2" | b"wim"
-        | b"esd" | b"sav" => 7,
-        b"sys" | b"dat" | b"log" | b"tmp" | b"etl" | b"evtx" | b"db" | b"sqlite" | b"ldb"
-        | b"mui" | b"cat" | b"manifest" | b"ini" | b"bak" | b"old" | b"blf" | b"regtrans-ms"
-        | b"edb" | b"pf" | b"dmp" | b"bin" => 8,
+        b"zip" | b"7z" | b"rar" | b"tar" | b"gz" | b"xz" | b"zst" | b"bz2" | b"iso" | b"img" | b"cab" | b"cache" | b"vhd" | b"vhdx" | b"vmdk" | b"vdi"
+        | b"ova" | b"qcow2" | b"wim" | b"esd" | b"sav" => 7,
+        b"sys" | b"dat" | b"log" | b"tmp" | b"etl" | b"evtx" | b"db" | b"sqlite" | b"ldb" | b"mui" | b"cat" | b"manifest" | b"ini" | b"bak" | b"old"
+        | b"blf" | b"regtrans-ms" | b"edb" | b"pf" | b"dmp" | b"bin" => 8,
         _ => 6,
     }
 }

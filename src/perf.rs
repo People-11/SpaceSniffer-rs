@@ -66,9 +66,13 @@ mod imp {
             }
             if now.duration_since(since).as_secs_f64() >= 1.0 {
                 let acc = std::mem::take(&mut s.acc);
-                eprintln!("{:3} fps  {}", s.frames, line(acc.iter().map(|(n, sum, max, k)| {
-                    if is_count(n) { format!("{n} {:.0}/{max:.0}", sum / *k as f64) } else { format!("{n} {:.2}/{max:.2}", sum / *k as f64) }
-                })));
+                eprintln!(
+                    "{:3} fps  {}",
+                    s.frames,
+                    line(acc.iter().map(|(n, sum, max, k)| {
+                        if is_count(n) { format!("{n} {:.0}/{max:.0}", sum / *k as f64) } else { format!("{n} {:.2}/{max:.2}", sum / *k as f64) }
+                    }))
+                );
                 s.frames = 0;
                 s.since = Some(now);
             }
@@ -101,9 +105,9 @@ mod imp {
     pub fn frame(_: f64) {}
 }
 
-/// Time the rest of the scope as `name` (summed if used more than once a frame).
-pub use imp::span;
 /// Add `v` to this frame's `name` (a time in ms, or a count if `name` starts with '#').
 pub use imp::add;
 /// End of the frame; `work` ms of it were ours.
 pub use imp::frame;
+/// Time the rest of the scope as `name` (summed if used more than once a frame).
+pub use imp::span;

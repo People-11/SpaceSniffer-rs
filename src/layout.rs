@@ -2,8 +2,8 @@
 //! ("name - size") and its children are laid out inside.
 
 use crate::tree::{Item, ItemMap, Tree};
-use std::collections::HashSet;
 use eframe::egui::{Rect, pos2, vec2};
+use std::collections::HashSet;
 
 /// Dot pitch in points; must match `cs` in shader.wgsl (2pt rounded down to whole pixels).
 pub fn grid(ppp: f32) -> f32 {
@@ -75,9 +75,9 @@ pub const TONES: u8 = 4;
 
 /// Map colouring of the visible tiles (everything not open) on a dot-lattice grid of tile indices.
 /// Big tiles go first; each takes the tone sharing the least edge length with same-toned coloured
-/// neighbours (ties: the one farthest from the other neighbours' tones). Tiles
-/// visible in `prev` keep their tone (see below), so expanding a folder doesn't recolour the
-/// blocks around it; a final pass recolours any other tile still clashing.
+/// neighbours (ties: the one farthest from the other neighbours' tones). Tiles visible in `prev`
+/// keep their tone (see below), so expanding a folder doesn't recolour the blocks around it; a
+/// final pass recolours any other tile still clashing.
 fn tones(out: &mut [Tile], area: Rect, pitch: f32, prev: &[Tile]) {
     const NEAR: [f32; TONES as usize] = [0.0, 0.3, 0.08, 0.0]; // secondary cost by tone distance
     let cols = (area.width() / pitch).round() as isize;
