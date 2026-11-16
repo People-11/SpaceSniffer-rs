@@ -27,8 +27,9 @@ raw-window-handle = "0.6"
 perf = []
 
 [profile.release]
-# Size-optimised: the hot paths are I/O-bound (scan) or on the GPU; measured no fps/scan-time loss.
-opt-level = "s"
+# Smallest exe (~540 KB under "s"); the scan is I/O-bound, but layout and per-frame instance
+# building run 20-30% slower (e.g. ~520 vs ~650 fps uncapped in an 84k-tile folder).
+opt-level = "z"
 lto = "fat"
 codegen-units = 1
 strip = true

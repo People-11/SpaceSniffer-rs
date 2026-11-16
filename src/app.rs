@@ -578,7 +578,7 @@ pub struct App {
     /// Their bytes as each is read (see [`App::refresh_drives`]).
     drives_rx: Option<std::sync::mpsc::Receiver<Drive>>,
     status: String,
-    /// Frame timestamps of the last second, and smoothed CPU time per frame (ms).
+    /// Frame timestamps of the last second, and smoothed CPU time per whole frame (ms).
     frames: std::collections::VecDeque<Instant>,
     cpu_ms: f32,
     /// Alt+V (hidden): no vsync and a repaint every frame, to see the highest frame rate.
@@ -1609,8 +1609,11 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
-        // The whole previous frame on the CPU as eframe saw it (incl. tessellation and painting).
-        perf::add("prev-cpu", frame.info().cpu_usage.unwrap_or(0.0) as f64 * 1e3);
+        // The whole previous frame on the CPU as eframe saw it (incl. tessellation and painting), less
+        // the waits for the swapchain: also the status bar's figure, as `ui` alone misses the upload.
+        let prev_cpu = frame.info().cpu_usage.unwrap_or(0.0) * 1e3;
+        perf::add("prev-cpu", prev_cpu as f64);
+        self.cpu_ms = self.cpu_ms * 0.9 + prev_cpu * 0.1;
         let frame_t0 = Instant::now();
         self.frames.push_back(frame_t0);
         while self.frames.front().is_some_and(|t| frame_t0.duration_since(*t).as_secs_f32() > 1.0) {
@@ -1678,7 +1681,6 @@ impl eframe::App for App {
 
         self.delete_modal(&ctx);
 
-        self.cpu_ms = self.cpu_ms * 0.9 + frame_t0.elapsed().as_secs_f32() * 1000.0 * 0.1;
         perf::frame(frame_t0.elapsed().as_secs_f64() * 1e3);
         // The pixel field is static: keep drawing only while something moves (input repaints anyway).
         let easing = self.lit.tiles.iter().chain(&self.group_fx).any(|x| x.1 < 1.0);
