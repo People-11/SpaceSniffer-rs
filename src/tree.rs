@@ -324,6 +324,11 @@ fn worker(work: &Work, cv: &Condvar, tx: &Sender<Msg>, next: &AtomicU32, cancel:
 }
 
 /// List one directory, send its batch and return its subdirectories (empty once cancelled).
+// FILE_ATTRIBUTE_*: not stored on this disk.
+const OFFLINE: u32 = 0x1000;
+const RECALL_ON_OPEN: u32 = 0x4_0000;
+const RECALL_ON_DATA_ACCESS: u32 = 0x40_0000;
+
 fn list(path: PathBuf, id: u32, tx: &Sender<Msg>, next: &AtomicU32, cancel: &AtomicBool) -> Vec<(u32, PathBuf)> {
     if cancel.load(Ordering::Relaxed) {
         return vec![];
@@ -337,6 +342,14 @@ fn list(path: PathBuf, id: u32, tx: &Sender<Msg>, next: &AtomicU32, cancel: &Ato
             if ft.is_symlink() {
                 continue; // symlinks + junctions: avoid double counting and cycles
             }
+            // Cloud storage (OneDrive Files On Demand): count what is on this disk. An online-only file
+            // takes none of it, and a cloud folder is fetched just by listing it. Downloaded files
+            // count as usual. The recall bits show even though Windows disguises placeholders from
+            // apps like this one; exposing them instead makes std open each one for its metadata.
+            let Ok(m) = e.metadata() else { continue };
+            if std::os::windows::fs::MetadataExt::file_attributes(&m) & (RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS | OFFLINE) != 0 {
+                continue;
+            }
             let name = e.file_name();
             let name = name.to_string_lossy();
             if ft.is_dir() {
@@ -344,7 +357,7 @@ fn list(path: PathBuf, id: u32, tx: &Sender<Msg>, next: &AtomicU32, cancel: &Ato
                 sub.push((cid, e.path()));
                 b.dirs.push((cid, name.into()));
             } else {
-                b.push_file(&name, e.metadata().map_or(0, |m| m.len()));
+                b.push_file(&name, m.len());
             }
         }
     }

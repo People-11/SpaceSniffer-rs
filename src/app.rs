@@ -388,6 +388,14 @@ impl Wave {
     }
 }
 
+/// Collapse `d` and every expansion inside it (a press on its title strip). A folder open by
+/// default (shallow level) stays open; only what was expanded inside it folds.
+fn fold(t: &Tree, expanded: &mut HashSet<u32>, d: u32) -> bool {
+    let n = expanded.len();
+    expanded.retain(|&e| e != d && !is_ancestor(t, d, e));
+    expanded.len() != n
+}
+
 /// Accordion expand/collapse of `d`: one expanded folder per level. Collapsing also folds
 /// everything inside it; expanding keeps only the expansions on the path down to `d`.
 /// `open`: `d` is already open by default (shallow level), so there is nothing to expand.
@@ -1183,9 +1191,10 @@ impl App {
         let hover = hit.map(|(x, _)| x.item);
         let hit_open = hit.is_some_and(|(x, _)| x.open);
         let on_title = hit.is_some_and(|(x, p)| x.open && p.y < x.rect.min.y + self.header);
-        // A press on any folder expands/collapses it at once (mouse *down*); a second press at the
-        // same spot within the double-click time zooms into the folder the first press hit (for a
-        // file: its folder), stacking on the expand animation.
+        // A press on any folder expands/collapses it at once (mouse *down*), one on its title strip
+        // folds it and everything inside; a second press at the same spot within the double-click
+        // time zooms into the folder the first press hit (for a file: its folder), stacking on the
+        // expand animation.
         if let Some(pos) = resp.hover_pos().filter(|_| ui.input(|i| i.pointer.primary_pressed())) {
             let time = ui.input(|i| i.time);
             match self.last_press.take() {
@@ -1197,9 +1206,11 @@ impl App {
                 }
                 _ => {
                     if let Some(Item::Dir(d)) = hover
-                        && d != self.view
-                        && !on_title // the title strip only zooms (double-click), never collapses
-                        && toggle(self.tree.as_ref().unwrap(), &mut self.expanded, d, hit_open)
+                        && (if on_title {
+                            fold(self.tree.as_ref().unwrap(), &mut self.expanded, d)
+                        } else {
+                            d != self.view && toggle(self.tree.as_ref().unwrap(), &mut self.expanded, d, hit_open)
+                        })
                     {
                         self.expand_ver += 1;
                         self.toggled = Some(d);
@@ -1864,5 +1875,16 @@ mod tests {
         assert!(toggle(&t, &mut ex, 2, false), "collapse folds the inside too");
         assert!(ex.is_empty());
         assert!(!toggle(&t, &mut ex, 2, true), "default-open dir has nothing to expand");
+        // Title strip: folds the folder and everything below it, not what is above.
+        ex = HashSet::from([1, 3]);
+        assert!(fold(&t, &mut ex, 3));
+        assert_eq!(ex, HashSet::from([1]));
+        ex = HashSet::from([1, 3]);
+        assert!(fold(&t, &mut ex, 1));
+        assert!(ex.is_empty());
+        ex = HashSet::from([1, 3]);
+        assert!(fold(&t, &mut ex, 0), "the view's own title folds everything");
+        assert!(ex.is_empty());
+        assert!(!fold(&t, &mut ex, 2), "nothing expanded: no change");
     }
 }
