@@ -93,6 +93,7 @@ pub fn reveal(p: &Path) {
 /// - Pure moves don't repaint: dragging the title bar sends WM_WINDOWPOSCHANGED per mouse step,
 ///   winit turns it into `Moved`, egui repaints, and each frame waits in present inside the
 ///   modal move loop, so the window lags and judders. Nothing we draw depends on the window position.
+/// - A dark title bar, kept dark after the settings broadcasts that winit answers with the system theme.
 pub fn setup_window(h: &impl raw_window_handle::HasWindowHandle) {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::Shell::SetWindowSubclass;
@@ -103,7 +104,8 @@ pub fn setup_window(h: &impl raw_window_handle::HasWindowHandle) {
     let raw_window_handle::RawWindowHandle::Win32(w) = wh.as_raw() else { return };
     let hwnd = w.hwnd.get() as windows_sys::Win32::Foundation::HWND;
     unsafe {
-        SetWindowSubclass(hwnd, Some(move_filter), 1, 0);
+        SetWindowSubclass(hwnd, Some(filter), 1, 0);
+        dark_title(hwnd);
         let module = GetModuleHandleW(std::ptr::null());
         for (metric, which) in [(SM_CXICON, ICON_BIG), (SM_CXSMICON, ICON_SMALL)] {
             let s = GetSystemMetrics(metric);
@@ -115,7 +117,14 @@ pub fn setup_window(h: &impl raw_window_handle::HasWindowHandle) {
     }
 }
 
-unsafe extern "system" fn move_filter(
+/// The UI is always dark, so is the title bar, whatever the system theme.
+fn dark_title(hwnd: windows_sys::Win32::Foundation::HWND) {
+    use windows_sys::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
+    let dark: i32 = 1;
+    unsafe { DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE as u32, (&raw const dark).cast(), size_of::<i32>() as u32) };
+}
+
+unsafe extern "system" fn filter(
     hwnd: windows_sys::Win32::Foundation::HWND,
     msg: u32,
     wp: windows_sys::Win32::Foundation::WPARAM,
@@ -124,7 +133,7 @@ unsafe extern "system" fn move_filter(
     _data: usize,
 ) -> windows_sys::Win32::Foundation::LRESULT {
     use windows_sys::Win32::UI::Shell::DefSubclassProc;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{DefWindowProcW, SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS, WM_WINDOWPOSCHANGED};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{DefWindowProcW, SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS, WM_SETTINGCHANGE, WM_WINDOWPOSCHANGED};
     unsafe {
         if msg == WM_WINDOWPOSCHANGED {
             let flags = (*(lp as *const WINDOWPOS)).flags;
@@ -132,6 +141,12 @@ unsafe extern "system" fn move_filter(
                 return DefWindowProcW(hwnd, msg, wp, lp);
             }
         }
-        DefSubclassProc(hwnd, msg, wp, lp)
+        let r = DefSubclassProc(hwnd, msg, wp, lp);
+        // winit follows the system theme on every settings broadcast and switches a light system's
+        // title bar back to light (it turned white at random): set it dark again.
+        if msg == WM_SETTINGCHANGE {
+            dark_title(hwnd);
+        }
+        r
     }
 }

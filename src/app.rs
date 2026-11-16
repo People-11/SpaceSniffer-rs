@@ -581,6 +581,8 @@ pub struct App {
     /// Frame timestamps of the last second, and smoothed CPU time per frame (ms).
     frames: std::collections::VecDeque<Instant>,
     cpu_ms: f32,
+    /// Alt+V (hidden): no vsync and a repaint every frame, to see the highest frame rate.
+    uncapped: bool,
 }
 
 impl App {
@@ -627,6 +629,7 @@ impl App {
             status: "Ready".into(),
             frames: Default::default(),
             cpu_ms: 0.0,
+            uncapped: false,
         };
         app.refresh_drives(&cc.egui_ctx);
         if let Some(rs) = cc.wgpu_render_state.as_ref() {
@@ -1597,6 +1600,12 @@ fn setup_style(ctx: &egui::Context) {
 }
 
 impl eframe::App for App {
+    /// The background is the clear colour, so the panels need no fill: under the treemap it was a
+    /// whole window of pixels drawn every frame only to be covered by the pixel field.
+    fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
+        BG.to_normalized_gamma_f32()
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
@@ -1613,13 +1622,21 @@ impl eframe::App for App {
             self.pump();
         }
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, Key::V)) {
+            self.uncapped = !self.uncapped;
+            if let Some(mut c) = frame.wgpu_surface_config() {
+                // Immediate where the driver has it (all the big Windows Vulkan ones), else whatever skips vsync.
+                c.present_mode = if self.uncapped { wgpu::PresentMode::AutoNoVsync } else { wgpu::PresentMode::Fifo };
+                frame.set_wgpu_surface_config(c);
+            }
+        }
 
-        egui::Panel::top("toolbar").frame(egui::Frame::NONE.fill(BG).inner_margin(Margin::symmetric(10, 6))).show(ui, |ui| {
+        egui::Panel::top("toolbar").frame(egui::Frame::NONE.inner_margin(Margin::symmetric(10, 6))).show(ui, |ui| {
             let _s = perf::span("toolbar");
             self.toolbar(ui)
         });
 
-        egui::Panel::bottom("status").frame(egui::Frame::NONE.fill(BG).inner_margin(Margin::symmetric(12, 4))).show(ui, |ui| {
+        egui::Panel::bottom("status").frame(egui::Frame::NONE.inner_margin(Margin::symmetric(12, 4))).show(ui, |ui| {
             ui.horizontal(|ui| {
                 let dot = if self.scan.is_some() { c32(5) } else { c32(1) };
                 ui.label(RichText::new("●").color(dot));
@@ -1628,11 +1645,17 @@ impl eframe::App for App {
                     let v = &t.dirs[self.view as usize];
                     ui.label(RichText::new(format!("{} · {} files", fmt_size(v.size), v.nfiles)).color(TEXT_DIM));
                 }
-                ui.label(RichText::new(format!("{} · {} fps · {:.1} ms", self.gpu_info, self.frames.len(), self.cpu_ms)).color(TEXT_DIM.gamma_multiply(0.6)));
+                let mode = if self.uncapped { " · Uncapped" } else { "" };
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("{} · {} FPS · {:.1} ms{mode}", self.gpu_info, self.frames.len(), self.cpu_ms))
+                            .color(TEXT_DIM.gamma_multiply(0.6)),
+                    );
+                });
             });
         });
 
-        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(BG).inner_margin(Margin { left: 10, right: 10, top: 2, bottom: 4 })).show(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::NONE.inner_margin(Margin { left: 10, right: 10, top: 2, bottom: 4 })).show(ui, |ui| {
             if self.tree.is_none() {
                 self.chooser(ui, None);
                 return;
@@ -1659,7 +1682,7 @@ impl eframe::App for App {
         perf::frame(frame_t0.elapsed().as_secs_f64() * 1e3);
         // The pixel field is static: keep drawing only while something moves (input repaints anyway).
         let easing = self.lit.tiles.iter().chain(&self.group_fx).any(|x| x.1 < 1.0);
-        let busy = self.scan.is_some() || self.anim.is_some() || !self.particles.is_empty() || easing;
+        let busy = self.uncapped || self.scan.is_some() || self.anim.is_some() || !self.particles.is_empty() || easing;
         if busy {
             if minimized {
                 ctx.request_repaint_after(std::time::Duration::from_millis(250)); // keep the scan flowing
