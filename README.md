@@ -29,7 +29,7 @@
 cargo build --release
 ```
 
-产物 `target/release/spacesniffer-rs.exe`（约 5.4 MB），静态 CRT，无额外 DLL；需要支持 AVX2 的 CPU（x86-64-v3：Intel Haswell / AMD Zen 及以后，不含没有 AVX2 的 Pentium/Celeron/Atom），见 `.cargo/config.toml`；不内嵌字体，使用系统自带的 Segoe UI / 微软雅黑 / Segoe UI Symbol，工具栏图标用 Segoe Fluent Icons（Windows 10 上用 Segoe MDL2 Assets）。CI 见 `.github/workflows/build.yml`。
+产物 `target/release/spacesniffer-rs.exe`（约 4.8 MB），静态 CRT，无额外 DLL；需要支持 AVX2 的 CPU（x86-64-v3：Intel Haswell / AMD Zen 及以后，不含没有 AVX2 的 Pentium/Celeron/Atom），见 `.cargo/config.toml`；不内嵌字体，使用系统自带的 Segoe UI / 微软雅黑 / Segoe UI Symbol，工具栏图标用 Segoe Fluent Icons（Windows 10 上用 Segoe MDL2 Assets）。CI 见 `.github/workflows/build.yml`。
 
 `cargo build --release --features perf` 构建带控制台的性能调试版，每秒输出各阶段的帧耗时。
 
