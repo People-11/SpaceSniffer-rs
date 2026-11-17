@@ -163,16 +163,17 @@ fn fs(v: V) -> @location(0) vec4f {
     if (v.pt.y < v.rect.y + v.q.x) { n = strip + 0.6 * hover; }
     let fl = min(floor(n), 3.0);
     var level = fl + step(bayer4(cell), clamp(n - fl, 0.1, 0.9));
-    // Wave glow: that share of the dots goes to the top level, in a Bayer order of its own (transposed
-    // and offset from the tone's). A density, not a lift of the tile's level, so the band has one
-    // shape on every tile, dark or bright, whatever its colour.
-    if (bayer4(cell.yx + vec2f(1.0, 2.0)) < glow) { level = 4.0; }
     // Gutter: top row and left column of every tile big enough, so shared edges are one dark line. An
     // open folder's body is gutter too (its children cover it).
     let body = v.q.x > 0.0 && v.pt.y >= v.rect.y + v.q.x;
     // Tiles in a folder's block of small ones (p.y = 1) have none: the block has it.
     let own = v.p.y < 0.5 && min(ts.x, ts.y) >= 3.0;
     if ((own && min(rd.x, rd.y) < 0.5) || body) { level = 0.0; }
+    // Wave glow: that share of the dots goes to the top level, in a Bayer order of its own (transposed
+    // and offset from the tone's). A density, not a lift of the tile's level, so the band has one
+    // shape on every tile, dark or bright, whatever its colour; gutters and folder bodies included,
+    // or it breaks off wherever the front crosses one.
+    if (bayer4(cell.yx + vec2f(1.0, 2.0)) < glow) { level = 4.0; }
     return vec4f(shade(col, level) * inten, 1.0);
 }
 
