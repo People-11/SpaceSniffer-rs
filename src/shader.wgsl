@@ -1,11 +1,6 @@
-// One instance = one rect. The fragment shader procedurally draws the dot-matrix
-// "pixel field" (5 levels, ordered dither); particles are single dots of it.
-//
-// Transitions are done by the dot matrix itself (no alpha cross-fades): a wave sweeps from the
-// click point; as it passes, each dot cell flips from the old layer to the new one in place. The
-// front carries light: it lifts the levels of the dots around it, which then cool back down.
-// A cell is never empty, so the front has no dark gap. A transition started mid-way stacks: each
-// cell shows the layer of the newest wave that has passed it, while the older waves run on.
+// One instance = one rect, drawn as a dot-matrix pixel field (5 levels, ordered dither). Transitions:
+// a wave from the click flips each dot cell from the old layer to the new one, its front lighting up
+// the dots around it. Stacked waves: a cell shows the layer of the newest one passed.
 
 struct U {
     origin: vec2f,
@@ -15,8 +10,7 @@ struct U {
     cell0: vec2f, // first dot cell of the draw's texture (origin/size above cover its cells)
     header: f32,  // title strip height (pt) of open folders
     ngroups: f32,
-    // Per wave, 3 vec4s: origin.xy, max distance, progress K (0..1); region it acts on (min.xy,
-    // max.xy); x = 1 if outside that region is new already (zoom out: the ring closes in).
+    // Per wave, 3 vec4s: origin.xy, max distance, progress; region; x = 1: outside it is new (zoom out).
     w: array<vec4f, 12>,
     // Per layer, its camera: layout rect, where that is on screen (min.xy, max.xy each).
     cams: array<vec4f, 10>,
@@ -67,8 +61,7 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> V {
     let kind = i.p.x & 3u;
     o.color = vec4f(i.color.rgb, i.color.a * select(1.0, 4.0, kind == 2u));
     o.p = vec4f(f32(kind), f32((i.p.x >> 2u) & 1u), f32(i.p.z), f32(i.p.w));
-    // Inside a folder lit as a whole by its last layer's light (its rect strictly contains ours):
-    // lit as much.
+    // Inside a folder lit as a whole by its last layer's light (strictly inside): lit as much.
     var hover = max(i.q.x, f32(i.d.x) / 255.0);
     for (var g = 0u; g < u32(u.ngroups); g++) {
         let gr = u.groups[g * 2u];
@@ -94,24 +87,23 @@ fn shade(col: vec3f, level: f32) -> vec3f {
     return col * (0.07 + 0.93 * pow(level / 4.0, 1.6));
 }
 
-// Must match WAVE_COOL in app.rs: how long (in progress units) a flipped cell stays hot.
-const COOL: f32 = 0.3;
+// Transition waves (`Wave` in anim.rs is the CPU twin: keep them in step). Along a wave's path its
+// far corner is 1; the band has fixed widths there, so it keeps one shape all the way.
+const COOL: f32 = 0.15;   // glow behind the front, on the layer it brings, fading out
+const AHEAD: f32 = 0.04;  // glow ahead of the front, on the layer it takes away, fading in
+const DITHER: f32 = 0.04; // the front's ordered-dither band (narrowed at the origin: it flips at once)
+const TYPE: f32 = 0.3;    // labels type in behind the front; it travels on until the last one has
 
-// Wave i at screen point p: how far past this spot the front is. < 0: still old; >= 0: new, and
-// e / COOL is how far it has cooled. Distance from the origin plus the dot's Bayer threshold gives
-// each spot its delay, so the front is an ordered-dither band, not random grain.
-fn wave_e(i: u32, p: vec2f, cs: f32) -> f32 {
-    let w = u.w[i * 3u];
+// How far wave i's front is past p (< 0: not there yet), for a cell at dither threshold b. Outside
+// the wave's region: long past if all of it is new already (zoom out), else never.
+fn wave_e(i: u32, p: vec2f, b: f32) -> f32 {
+    let w = u.w[i * 3u]; // origin.xy, reach, progress
     let r = u.w[i * 3u + 1u];
-    let x = u.w[i * 3u + 2u];
-    if (any(p < r.xy) || any(p > r.zw)) { return select(-1.0, COOL, x.x > 0.5); }
-    // Where p lies along the front's path, 0..1 (Wave::dist in app.rs): a ring spreading out from
-    // the origin, or on a zoom out closing in on it from the corners.
+    let out = u.w[i * 3u + 2u].x > 0.5;
+    if (any(p < r.xy) || any(p > r.zw)) { return select(-1.0, 1.0, out); }
     let d0 = clamp(length(p - w.xy) / max(w.z, 1.0), 0.0, 1.0);
-    let d = select(d0, 1.0 - d0, x.x > 0.5);
-    // The band fades in with distance so the click point itself reacts on the very first frame.
-    let thr = d * 0.8 + bayer4(floor(p * u.ppp / cs)) * 0.2 * min(d * 4.0, 1.0);
-    return w.w * (1.0 + COOL) - thr;
+    let d = select(d0, 1.0 - d0, out); // a zoom out's ring closes in on the origin
+    return w.w * (1.0 + DITHER + TYPE) - d - DITHER * b * min(d / DITHER, 1.0);
 }
 
 @fragment
@@ -126,74 +118,57 @@ fn fs(v: V) -> @location(0) vec4f {
         return vec4f(shade(col, inten), 1.0);
     }
 
-    // Dot lattice fixed to the screen, in physical pixels: like an LED matrix, the dots never
-    // move or scale; zooming tiles slide their colours across it. Tiles at rest sit exactly on it.
-    // ~2pt dot pitch (3px at 150% scaling), dots fill their cell with no gap.
+    // Dot lattice fixed to the screen in physical pixels (~2pt pitch): zooming tiles slide across it.
     let cs = max(2.0, floor(2.0 * u.ppp)); // = layout::grid() * ppp
     let cell = floor(v.pt * u.ppp / cs);
     let cc = (cell + 0.5) * cs / u.ppp; // its centre, in points
-    // Transition: each screen cell belongs to exactly one layer (every layer evaluates the same
-    // cell centre), so they never overlap or leave a hole, even while the camera zooms.
-    // Light of a wave front: rises on the layer it takes away just ahead of it, cools on the one it
-    // brings. A tile shared by several layers is only lit by the waves at its ends.
-    var born = 0.0;
+    // Waves: every layer evaluates the same cell centre, so each cell shows exactly one layer, that of
+    // the newest wave passed. `glow`: the share of its dots the fronts around it light up.
+    var glow = 0.0;
     let nw = u32(u.nw);
     if (nw > 0u) {
+        let b = bayer4(cell);
         var es = array<f32, 4>(-1.0, -1.0, -1.0, -1.0);
-        var s = 0u; // layer shown here: the newest wave passed
+        var s = 0u;
         for (var i = 0u; i < nw; i++) {
-            es[i] = wave_e(i, cc, cs);
+            es[i] = wave_e(i, cc, b);
             if (es[i] >= 0.0) { s = i + 1u; }
         }
         if (s < lo || s > hi) { discard; }
-        if (s == lo && lo > 0u) {
-            let c = 1.0 - clamp(es[lo - 1u] / COOL, 0.0, 1.0);
-            born = c * c;
-        }
-        if (s == hi && hi < nw) {
-            let ahead = clamp(1.0 + es[hi] / (COOL * 0.25), 0.0, 1.0);
-            born = max(born, ahead * ahead);
-        }
+        if (s == lo && lo > 0u) { glow = 1.0 - clamp(es[lo - 1u] / COOL, 0.0, 1.0); }
+        if (s == hi && hi < nw) { glow = max(glow, clamp(1.0 + es[hi] / AHEAD, 0.0, 1.0)); }
     }
 
-    // Quiet zone: the dots under a label and one dot around it turn into title strip dots (below),
-    // so the text always sits on a dark patch; it fades with the label during transitions.
+    // Quiet zone: a dark patch under a label (and one dot around it), fading with the label.
     var quiet = 0.0;
     if (v.t.z > v.t.x) {
         let out = max(v.t.xy - cc, cc - v.t.zw);
         quiet = select(0.0, v.q.w, max(out.x, out.y) < cs / u.ppp);
     }
 
-    // Ordered dither: every dot takes one of 5 levels. A tile's value picks the mix of two adjacent
-    // levels through a 4x4 Bayer matrix, so tones read as regular patterns instead of noise.
-    // Layout gives edge neighbours different tones. Hovered tiles (and every block of a hovered
-    // title's folder) ease to the same top level.
+    // Ordered dither: a tile's value mixes two adjacent levels through the Bayer matrix.
     let tone = v.q.z;
     let org = round(v.rect.xy * u.ppp / cs);
     let ts = max(round((v.rect.zw - v.rect.xy) * u.ppp / cs), vec2f(1.0));
     let rd = cell - org;
-    // The 4 tones sit between two levels (around 30 % / 70 % mixes: 1.3, 1.7, 2.3, 2.7), never on
-    // one, so no tile turns into a solid block. A top-left light sweeps each tile through ~6 Bayer
-    // steps (+-0.175 of a level), staying inside its own half so tones never meet. The bands
-    // always run at 45 degrees whatever the tile's shape, spread evenly from corner to corner.
+    // The 4 tones sit between levels (1.3, 1.7, 2.3, 2.7), never on one, so no tile turns solid; a
+    // 45-degree light sweeps each tile by +-0.175 of a level, staying within its tone.
     let g = 1.0 - (rd.x + rd.y) / (ts.x + ts.y);
     let k = round(tone * 3.0);
     var n = 1.3 + 0.4 * k + 0.2 * floor(k * 0.5) + (g - 0.5) * 0.35;
     n = mix(n, 3.4, hover); // a level below the wave's light, which then still shows on a lit tile
-    // The wave's light lifts the tile's own levels (no white overlay): the pattern itself glows
-    // and settles back as it cools.
-    n = min(n + 2.0 * born, 3.9);
-    // Directory header strip: sparse and dark under its title, lit on hover. A label's quiet zone
-    // takes the level of a lit strip (a fading label's mixes it with the tile's, still pure dither).
-    let strip = 0.4 + 2.0 * born;
+    // Title strip: sparse and dark, lit on hover; a label's quiet zone takes a lit strip's level.
+    let strip = 0.4;
     n = mix(n, strip + 0.6, quiet);
     if (v.pt.y < v.rect.y + v.q.x) { n = strip + 0.6 * hover; }
     let fl = min(floor(n), 3.0);
     var level = fl + step(bayer4(cell), clamp(n - fl, 0.1, 0.9));
-    // Gutter: the top row and left column of every tile big enough to spare them, so each shared
-    // edge is one dark line; smaller tiles are told apart by their pattern alone.
-    // An open folder's body is gutter too: its children cover it, except the gutter around its
-    // block of small tiles (see layout.rs).
+    // Wave glow: that share of the dots goes to the top level, in a Bayer order of its own (transposed
+    // and offset from the tone's). A density, not a lift of the tile's level, so the band has one
+    // shape on every tile, dark or bright, whatever its colour.
+    if (bayer4(cell.yx + vec2f(1.0, 2.0)) < glow) { level = 4.0; }
+    // Gutter: top row and left column of every tile big enough, so shared edges are one dark line. An
+    // open folder's body is gutter too (its children cover it).
     let body = v.q.x > 0.0 && v.pt.y >= v.rect.y + v.q.x;
     // Tiles in a folder's block of small ones (p.y = 1) have none: the block has it.
     let own = v.p.y < 0.5 && min(ts.x, ts.y) >= 3.0;
@@ -201,8 +176,7 @@ fn fs(v: V) -> @location(0) vec4f {
     return vec4f(shade(col, level) * inten, 1.0);
 }
 
-// The draw rendered at one texel per dot cell (see gfx.rs), scaled up onto the screen: a triangle
-// covering the callback's viewport, each pixel taking its cell's texel.
+// Blit: the draw's one-texel-per-cell texture scaled up onto the callback's viewport.
 @group(1) @binding(0) var field: texture_2d<f32>;
 
 @vertex

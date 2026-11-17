@@ -1,12 +1,7 @@
-//! Instanced wgpu renderer for the pixel-field tiles (treemap, drive picker) and particles,
-//! injected into egui's render pass via a paint callback.
-//!
-//! Every dot cell is one colour, so each draw is rendered at one texel per cell into its own
-//! texture first, then scaled up cell by cell onto the screen: at 4K the heavy shader runs on
-//! 1/9-1/16 of the pixels.
-//!
-//! The instances stay on the GPU between frames, in layout coordinates: each frame sends only each
-//! layer's camera, the folders lit as a whole, and per instance 4 bytes of hover and label state.
+//! Instanced wgpu renderer for the pixel field (treemap, drive chooser, particles) in an egui paint
+//! callback. Each draw renders one texel per dot cell, then scales that up (the heavy shader runs on
+//! 1/9-1/16 of the pixels at 4K). Instances stay on the GPU; per frame only the cameras, lit folders
+//! and 4 bytes per instance go up.
 
 use eframe::egui;
 use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, RenderState, ScreenDescriptor};
@@ -27,8 +22,7 @@ pub struct Inst {
     pub q: [u8; 4],
 }
 
-/// An instance's state that changes from frame to frame: hover, label box (index into the draw's
-/// `boxes`, NO_LABEL: none), label visibility (scales the box's dimming), unused; 0..255 = 0..1.
+/// Per-frame instance state: hover, label box (index into `boxes`, NO_LABEL: none), label visibility, -.
 pub type Dyn = [u8; 4];
 pub const NO_DYN: Dyn = [0, NO_LABEL, 0, 0];
 
@@ -39,16 +33,14 @@ pub const IDENTITY: Cam = [[0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]];
 pub const LAYERS: usize = MAX_WAVES + 1;
 /// Folders lit as a whole (with every tile inside them) a draw can carry.
 pub const MAX_GROUPS: usize = 16;
-/// A folder lit as a whole: (rect in layout coords, lift 0..1, layer `hi` whose light it is). Every
-/// instance of that layer strictly inside the rect is lit as much.
+/// A folder lit as a whole: (layout rect, lift 0..1, layer `hi`); its layer's instances inside are lit too.
 pub type Group = ([f32; 4], f32, u8);
 
 /// What one draw shows.
 #[derive(Default)]
 pub struct Field {
     pub insts: Arc<[Inst]>,
-    /// Identifies `insts` (0: a one-off, uploaded every frame): the same as the slot's last draw
-    /// means they are on the GPU already.
+    /// Identifies `insts` (0: a one-off, uploaded every frame); the same as the slot's last: on the GPU.
     pub ver: u64,
     /// One per instance; empty: NO_DYN for all.
     pub dyns: Vec<Dyn>,
@@ -298,8 +290,7 @@ impl CallbackTrait for Draw {
         waves[..nw].copy_from_slice(&f.waves[..nw]);
         let nc = f.cams.len().min(LAYERS);
         cams[..nc].copy_from_slice(&f.cams[..nc]);
-        // shortcut: past MAX_GROUPS the rest are not lit as a whole; only hovering across many
-        // titles during a transition gets near it.
+        // shortcut: past MAX_GROUPS the rest are not lit as a whole; only fast hovering mid-transition gets near.
         for (g, &(rect, lift, hi)) in groups.iter_mut().zip(&f.groups) {
             *g = [rect, [lift, hi as f32, 0.0, 0.0]];
         }

@@ -1,6 +1,5 @@
-//! Embeds assets/icon.ico as the exe icon. Writes the .res file directly (no rc.exe needed): the
-//! MSVC linker takes it as is; for the GNU toolchain windres (ships next to MinGW gcc) turns it
-//! into a COFF object first.
+//! Embeds assets/icon.ico as the exe icon, writing the .res directly (no rc.exe): MSVC links it as
+//! is, the GNU toolchain converts it with windres first.
 
 use std::{env, fs, path::Path, process::Command};
 

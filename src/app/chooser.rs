@@ -1,8 +1,7 @@
 use super::*;
 
-/// The drive chooser as a layer of a transition: the bottom one of the zoom into a scan (as it was
-/// when the drive was picked), the top one of the zoom out of it back to the chooser. Screen coords
-/// are its layout coords.
+/// The drive chooser as a transition layer (bottom when zooming into a scan, top when leaving for
+/// it). Its layout coords are screen coords.
 #[derive(Clone)]
 pub struct Chooser {
     /// Drive blocks, and their title strips with the text in them.
@@ -13,9 +12,7 @@ pub struct Chooser {
     /// The picked drive's block (None: a typed path, no zoom), and where the wave starts.
     pub block: Option<Rect>,
     pub click: Pos2,
-    /// Its camera (layout -> screen, see [`Anim::motion`]) and card opacity when the drive was
-    /// picked: picked mid-way through a zoom back to it, the zoom into the drive takes over from
-    /// there. None: at rest.
+    /// Camera and card opacity when the drive was picked (mid-zoom back to it: the new zoom starts there).
     pub cam: Option<[Map; 2]>,
     pub card: f32,
 }
@@ -27,8 +24,7 @@ pub const CARD_FADE: f32 = 0.3;
 pub type Drive = (String, Option<(u64, u64)>);
 
 impl App {
-    /// List the drives now, their space once read: a slow or offline network drive can take
-    /// seconds to answer, which on the UI thread kept the window from showing.
+    /// List the drives now, their space later: a slow network drive must not hold up the window.
     pub fn refresh_drives(&mut self, ctx: &egui::Context) {
         let roots = win::drives();
         self.drives = roots.iter().map(|d| (d.clone(), self.drives.iter().find(|o| o.0 == *d).and_then(|o| o.1))).collect();
@@ -45,8 +41,7 @@ impl App {
         self.drives_rx = Some(rx);
     }
 
-    /// `ghost`: drawn over whatever else `ui` holds, at this opacity, during a zoom out of (into)
-    /// it (see [`Chooser`]): its card only, no drives, no input.
+    /// `ghost`: only its card, at this opacity, over a transition (no drives, no input).
     pub fn chooser(&mut self, ui: &mut egui::Ui, ghost: Option<f32>) -> Chooser {
         // Where the treemap of a drive picked here will be (as `treemap` lays it out).
         let area = field_rect(ui.available_rect_before_wrap().shrink(1.0), layout::grid(ui.ctx().pixels_per_point()));
@@ -74,8 +69,7 @@ impl App {
                 ui.set_width(520.0);
                 ui.label(RichText::new("Choose your space").size(24.0).strong().color(Color32::WHITE));
                 ui.add_space(14.0);
-                // Drives as pixel-field blocks like the treemap's folders: title strip, used space lit,
-                // free space dim; a gap between drives instead of borders.
+                // Drives as pixel-field blocks like folders: used space lit, free space dim.
                 let gap = (6.0 / pitch).round() * pitch;
                 let cols = self.drives.len().clamp(1, 3) as f32;
                 let size = vec2(((ui.available_width() - (cols - 1.0) * gap) / cols / pitch).floor() * pitch, header + (60.0 / pitch).round() * pitch);
@@ -86,8 +80,7 @@ impl App {
                     for (d, space) in &self.drives {
                         let (r, resp) = ui.allocate_exact_size(size, Sense::click());
                         let r = layout::snap(Rect::from_min_size(r.min, size), pitch);
-                        // Keyed by drive, not widget: the faded chooser of a transition (another Ui) and
-                        // the real one share it, so it never restarts from a stale hover.
+                        // Keyed by drive: the ghost chooser (another Ui) shares the hover, so it never restarts.
                         let hov = ui.ctx().animate_bool_with_time(egui::Id::unique(("drive", d)), resp.hovered(), HOVER_SECS);
                         let block = |rect: Rect, inten: f32, open: bool| Inst {
                             rect: [rect.min.x, rect.min.y, rect.max.x, rect.max.y],
@@ -158,8 +151,7 @@ impl App {
         snap
     }
 
-    /// Back to the chooser: zoom out to it (the tree goes once that is done, see [`App::leave`]);
-    /// nothing else acts meanwhile.
+    /// Back to the chooser: zoom out to it, then drop the tree (see [`App::leave`]).
     pub fn leave_for_chooser(&mut self, ctx: &egui::Context) {
         self.scan = None;
         self.status = "Ready".into();
@@ -169,10 +161,8 @@ impl App {
         self.particles.clear();
     }
 
-    /// The zoom out of the treemap into its drive's block on the chooser, the inverse of entering
-    /// (see [`Chooser`]): the chooser is the new top layer, the treemap shrinks under it. The tree is
-    /// dropped once that is done. A drive clicked meanwhile is entered at once, its zoom starting
-    /// from the chooser as it is on screen: false then (the caller goes on to draw that).
+    /// Zoom out of the treemap into its drive's block, then drop the tree. A drive clicked meanwhile is
+    /// entered at once from where the chooser is on screen: false then (the caller draws that).
     pub fn leave(&mut self, ui: &mut egui::Ui) -> bool {
         let now = self.now();
         let area = field_rect(ui.available_rect_before_wrap().shrink(1.0), self.pitch);
@@ -186,7 +176,7 @@ impl App {
         // The chooser, laid out (for where its drives are) and drawn as its card only.
         let card = self.card(now);
         let top = self.chooser(ui, Some(card));
-        // The chooser's camera now (the top layer's), or of whatever transition this leaves from.
+        // The chooser's camera now (or the running transition's).
         let from = Anim::motion(&self.anim, area, now);
         let cam = from[0];
         // Its widgets sit where it will come to rest: hit-test a click through where it is now.
@@ -206,8 +196,7 @@ impl App {
             }
         }
         if !self.left {
-            // Like a zoom out to a parent folder: the old view shrinks into the drive's block (none
-            // for a scanned folder: the wave alone), stacked on whatever transition is running.
+            // Like zooming out to a parent: the view shrinks into the drive's block (none for a folder).
             self.left = true;
             let root = &*self.tree.as_ref().unwrap().dirs[0].name;
             let block = self.drives.iter().position(|d| d.0.eq_ignore_ascii_case(root)).map(|i| top.blocks[i]);
@@ -233,9 +222,7 @@ impl App {
         Anim::push(&mut self.anim, from, area, step);
     }
 
-    /// Opacity of the chooser's card (heading, path row) during a zoom out of it (it fades away
-    /// over the start, from where it was when the drive was picked) or back to it (it fades in
-    /// over the end; none until that zoom starts).
+    /// Card opacity: fades out over the start of a zoom out of the chooser, in over the end of one back.
     pub fn card(&self, now: f32) -> f32 {
         let Some(a) = &self.anim else { return 0.0 };
         if self.leaving {

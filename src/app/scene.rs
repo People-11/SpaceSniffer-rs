@@ -1,14 +1,9 @@
 use super::*;
 
-/// One frame of hover easing. `direct`: (item, level 0..1) of tiles lit on their own (`lit`: the
-/// hovered tile and its parent); `groups`: folders whose whole block is lit (`group`: the hovered
-/// title's folder). Levels move by `step` per frame.
-///
-/// Moving between nested titles (or a title and a block under it) must never dim or stall what
-/// stays lit, however fast and however many levels:
-/// - an entry inside the folder now being lit keeps rising until that folder has caught up with
-///   it (its tiles are about to be lit by that folder anyway), then fades unseen beneath it;
-/// - what is lit is never dimmer than the lit folders around it, so it starts from their level.
+/// One frame of hover easing: `direct` (the hovered tile and its parent) and `groups` (folders lit
+/// as a whole) move by `step` toward `lit` / `group`. Crossing nested titles never dims or stalls
+/// what stays lit: an entry inside the folder being lit keeps rising until that folder catches up,
+/// and nothing lit starts below the lit folders around it.
 pub fn ease_hover(
     direct: &mut Vec<(Item, f32)>,
     groups: &mut Vec<(Item, f32)>,
@@ -18,7 +13,7 @@ pub fn ease_hover(
     rect_of: impl Fn(Item) -> Option<Rect>,
 ) {
     let inside = |it: Item, outer: Rect| rect_of(it).is_some_and(|r| r != outer && outer.contains_rect(r));
-    // Inherit first, from the levels as they were shown last frame, then move everything a step.
+    // Inherit from last frame's levels first, then move everything a step.
     for h in lit.into_iter().flatten() {
         if !direct.iter().any(|x| x.0 == h) {
             direct.push((h, 0.0));
@@ -45,41 +40,34 @@ pub fn ease_hover(
     groups.retain(|x| x.1 > 0.0);
 }
 
-/// Hover light of a layout: directly lit tiles (the hovered one and its parent; a handful), eased
-/// 0..1; and the rects of folders whose whole block is lit, with their eased lift.
+/// Hover light of a layout: lit tiles (a handful) and the rects of folders lit as a whole, 0..1.
 #[derive(Clone, Default)]
 pub struct Lit {
     pub tiles: Vec<(Item, f32)>,
     pub groups: Vec<(Rect, f32)>,
 }
 
-/// Paint a layer stack's pixel field (`scene` under `cams`, filling `area`) under its labels, each
-/// shown as far as the `waves` let it.
+/// Paint a layer stack (`scene` under `cams`) under its labels, each shown as far as `waves` let it.
 #[allow(clippy::too_many_arguments)]
 pub fn paint_field(ui: &egui::Ui, area: Rect, scene: &Scene, cams: &[Map], light: Light, labels: Vec<Label>, waves: &[Wave]) {
     let (mut dyns, groups) = light;
     let _s = perf::span("labels");
     let mut boxes = vec![];
     let painter = ui.painter().with_clip_rect(area.expand(1.0).intersect(ui.clip_rect()));
-    // The pixel layer goes under the labels, but its quiet zones are only known once the labels
-    // are laid out: reserve its place in the paint order now, fill it in after.
+    // Reserve the pixel field's place under the labels; its quiet zones are known only after them.
     let field = painter.add(egui::Shape::Noop);
     for l in labels {
         let jitter = ((l.pos.x * 12.9898 + l.pos.y * 78.233).sin() * 43758.547).fract().abs();
         let es: Vec<f32> = waves.iter().map(|w| w.at(l.pos, jitter)).collect();
-        // Outgoing labels fade as a whole, incoming ones type in; the dark patch under a file
-        // label follows the same amount, so it never outstays (or precedes) its text.
+        // The dark patch under a file label follows its text in and out.
         let (f_in, fade) = shown(&es, l.lo, l.hi, l.fixed);
         if f_in * fade <= 0.0 {
             continue;
         }
         let typed = |s: &str| typed(s, f_in);
-        // Static labels always fit their tile, so they share the treemap's clip and egui draws all
-        // text in one batch; only mid-transition (tiles resizing under them) are they clipped
-        // per tile. No shadow: labels sit on a dark title strip or a dimmed quiet zone.
+        // At rest labels fit their tile: one shared clip lets egui batch all text. Per tile mid-transition.
         let mut p = if !waves.is_empty() { painter.with_clip_rect(l.clip.intersect(painter.clip_rect())) } else { painter.clone() };
-        // Fade through the painter, not the text colour: the colour is part of egui's text layout
-        // cache key, so a fading colour laid out every label again each frame (700 labels: ~5 ms).
+        // Fade via the painter: text colour is in egui's layout cache key (700 fading labels: ~5 ms/frame).
         p.multiply_opacity(fade);
         let font = FontId::proportional(l.size);
         let white = Color32::from_white_alpha(234); // 0.92
@@ -133,20 +121,18 @@ pub struct Label {
     pub text: String,
     /// File labels: size line under the (up to 2-line) name; empty for folder titles.
     pub sub: String,
-    /// File labels: room for the text in layout space (fit is decided there, so zooms don't pop).
+    /// File labels: room in layout space (fit decided there, so zooms don't pop).
     pub room: Vec2,
     pub size: f32,
     /// Index of the tile's instance (gets the label box as its quiet zone).
     pub inst: usize,
 }
 
-/// What a layer stack depends on: (layout, its tiles (address, count), each step (start time, its
-/// old tiles' address)). The same key means the same instances.
+/// Same key, same instances: (layout, tiles address and count, each step's start time and old tiles).
 pub type SceneKey = (LayoutKey, usize, usize, Vec<(u32, usize)>);
 
-/// A layer stack's instances, in layout coordinates, built only when the stack changes (a new
-/// layout, a step pushed or pruned, the scan going on): they stay on the GPU. Frame to frame only
-/// the cameras, the hover light and the labels move, see [`App::labels`] and [`light`].
+/// A layer stack's instances in layout coords, rebuilt only when the stack changes and kept on the
+/// GPU; per frame only cameras, hover light and labels move.
 pub struct Scene {
     /// None: a one-off (see `App::leave`).
     pub key: Option<SceneKey>,
@@ -181,8 +167,7 @@ pub enum CandKind {
 /// Per instance hover and label state, and the folders lit as a whole.
 pub type Light = (Vec<gfx::Dyn>, Vec<gfx::Group>);
 
-/// Hover light of a scene this frame: each lit tile's level, and the folders lit as a whole. A tile
-/// is lit as the layer it ends at (`hi`) was: `steps[hi].lit`, the top one `top`.
+/// This frame's hover light; a tile is lit as its last layer `hi` was (`steps[hi].lit`, or `top`).
 pub fn light(scene: &mut Scene, steps: &[Step], top: &Lit) -> Light {
     let (items, insts) = (&scene.items, &scene.insts);
     let mut dyns = vec![gfx::NO_DYN; insts.len()];
@@ -200,9 +185,8 @@ pub fn light(scene: &mut Scene, steps: &[Step], top: &Lit) -> Light {
 }
 
 impl App {
-    /// Draw the layer stack filling `area`: the running transition's layers under the current tiles,
-    /// or under `chooser` (leaving for it). Its scene is rebuilt only when the stack changes; with
-    /// the chooser on top (its blocks light up on hover) it is a one-off every frame.
+    /// Draw the layer stack in `area`, the current tiles on top (or `chooser`, leaving for it). The scene
+    /// is kept until the stack changes; with the chooser on top it is rebuilt every frame.
     pub fn draw(&mut self, ui: &egui::Ui, area: Rect, chooser: Option<&Chooser>) {
         let now = self.now();
         let (steps, cams, waves) = match &self.anim {
@@ -240,10 +224,8 @@ impl App {
         }
     }
 
-    /// The layer stack's scene: layer j (`steps[j].old`, the top one the current tiles) in its own
-    /// layout's coords, each tile tagged with the layers it belongs to. A tile an expand/collapse
-    /// left unchanged belongs to both layers around it: drawn once, untouched by that wave.
-    /// `chooser_top`: the chooser is the top layer (leaving).
+    /// Layer j (`steps[j].old`, the top one the current tiles) in its own layout's coords. A tile an
+    /// expand/collapse left unchanged belongs to both layers: drawn once, untouched by that wave.
     pub fn scene(&self, steps: &[Step], chooser_top: Option<&Chooser>, key: Option<SceneKey>, ver: u64) -> Scene {
         let n = steps.len();
         let layer = |j: usize| if j < n { &steps[j].old[..] } else { &self.tiles[..] };
@@ -284,8 +266,7 @@ impl App {
                     q: [0, (x.tone as u16 * 255 / (layout::TONES - 1) as u16) as u8, 0, 0],
                 });
                 items.push(Some(x.item));
-                // Folder titles; files and closed folders big enough for their name (up to 2 lines)
-                // and size inside.
+                // Folder titles; files and closed folders big enough for their name and size.
                 if let Some(fixed) = label
                     && (x.open || (!is_dir || x.titled) && r.width() > 24.0 && r.height() > 24.0)
                 {
@@ -304,53 +285,31 @@ impl App {
         let any = |a: f32, b: f32| (b / p - 0.5).ceil() > (a / p - 0.5).ceil();
         let mut labels = vec![];
         for c in cands {
-            let (lo, hi, fixed, lr) = (c.lo, c.hi, c.fixed, c.rect);
-            let r = apply_rect(cams[lo], lr);
-            let (item, open, solid) = match &c.what {
-                CandKind::Title(text) => {
-                    let pos = pos2(r.min.x + 4.0, r.center().y);
-                    labels.push(Label { lo, hi, fixed, clip: r, pos, text: text.clone(), sub: String::new(), room: Vec2::ZERO, size: 12.0, inst: 0 });
-                    continue;
+            let (lr, r) = (c.rect, apply_rect(cams[c.lo], c.rect));
+            let (clip, pos, text, sub, room, size) = match &c.what {
+                CandKind::Title(text) => (r, pos2(r.min.x + 4.0, r.center().y), text.clone(), String::new(), Vec2::ZERO, 12.0),
+                &CandKind::Tile { item, open, solid } => {
+                    let v = r.intersect(area);
+                    if !any(v.min.x, v.max.x) || !any(v.min.y, v.max.y) {
+                        continue;
+                    }
+                    let info = match item {
+                        Item::Dir(d) => t.dirs.get(d as usize).map(|x| (x.size, &*x.name)),
+                        Item::File(d, f) => t.dirs.get(d as usize).and_then(|x| Some((x.files.get(f as usize)?.size, x.file_name(f)))),
+                    };
+                    let Some((bytes, name)) = info else { continue };
+                    if open {
+                        let clip = Rect::from_min_max(r.min, pos2(r.max.x - 2.0, (r.min.y + self.header).min(r.max.y)));
+                        (clip, pos2(r.min.x + 4.0, r.min.y + self.header * 0.5), format!("{name} - {}", fmt_size(bytes)), String::new(), Vec2::ZERO, 11.5)
+                    } else {
+                        // Centred on what shows of the tile: its own gutter (top row, left column) is not.
+                        let pos = r.center() + Vec2::splat(if solid { 0.0 } else { self.pitch * 0.5 });
+                        let size = if lr.height() > 60.0 && lr.width() > 110.0 { 13.0 } else { 11.0 };
+                        (r.shrink(2.0), pos, name.to_string(), fmt_size(bytes), lr.shrink(3.0).size(), size)
+                    }
                 }
-                &CandKind::Tile { item, open, solid } => (item, open, solid),
             };
-            let v = r.intersect(area);
-            if !any(v.min.x, v.max.x) || !any(v.min.y, v.max.y) {
-                continue;
-            }
-            let info = match item {
-                Item::Dir(d) => t.dirs.get(d as usize).map(|x| (x.size, &*x.name)),
-                Item::File(d, f) => t.dirs.get(d as usize).and_then(|x| Some((x.files.get(f as usize)?.size, x.file_name(f)))),
-            };
-            let Some((size, name)) = info else { continue };
-            labels.push(if open {
-                Label {
-                    lo,
-                    hi,
-                    fixed,
-                    clip: Rect::from_min_max(r.min, pos2(r.max.x - 2.0, (r.min.y + self.header).min(r.max.y))),
-                    pos: pos2(r.min.x + 4.0, r.min.y + self.header * 0.5),
-                    text: format!("{} - {}", name, fmt_size(size)),
-                    sub: String::new(),
-                    room: Vec2::ZERO,
-                    size: 11.5,
-                    inst: c.inst,
-                }
-            } else {
-                Label {
-                    lo,
-                    hi,
-                    fixed,
-                    clip: r.shrink(2.0),
-                    // Centred on what shows of the tile: its own gutter (top row, left column) is not.
-                    pos: r.center() + Vec2::splat(if solid { 0.0 } else { self.pitch * 0.5 }),
-                    text: name.to_string(),
-                    sub: fmt_size(size),
-                    room: lr.shrink(3.0).size(),
-                    size: if lr.height() > 60.0 && lr.width() > 110.0 { 13.0 } else { 11.0 },
-                    inst: c.inst,
-                }
-            });
+            labels.push(Label { lo: c.lo, hi: c.hi, fixed: c.fixed, clip, pos, text, sub, room, size, inst: c.inst });
         }
         labels
     }
@@ -360,8 +319,7 @@ impl App {
 mod tests {
     use super::*;
 
-    /// Root (1) > mid (2) > inner (3) title strips: whichever way and however fast the pointer
-    /// crosses them, a block that ends up lit never dims and never stalls on the way to full.
+    /// Crossing nested title strips in any order and speed: a block that ends up lit never dims or stalls.
     #[test]
     fn hover_across_nested_titles_never_dims_or_stalls() {
         let rect = |i: f32| Rect::from_min_max(pos2(i, i), pos2(100.0 - i, 100.0 - i));

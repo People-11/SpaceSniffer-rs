@@ -15,8 +15,7 @@ pub fn header(pitch: f32) -> f32 {
     (15.0 / pitch).round().max(1.0) * pitch
 }
 
-/// Snap a rect onto the dot lattice so tiles hold whole dots and neighbours meet on a lattice
-/// line (no half-cut dots, no hairline gaps).
+/// Snap a rect onto the dot lattice: whole dots, no hairline gaps between neighbours.
 pub fn snap(r: Rect, pitch: f32) -> Rect {
     let s = |v: f32| (v / pitch).round() * pitch;
     Rect::from_min_max(pos2(s(r.min.x), s(r.min.y)), pos2(s(r.max.x), s(r.max.y)))
@@ -38,8 +37,7 @@ pub struct Tile {
     pub cat: u8,
 }
 
-/// Does a folder named `name` at `r` get a title strip (and children)? Only if its name fits;
-/// otherwise it is a plain pixel field (not opened) until zoomed in enough to read it.
+/// A folder gets a title strip (and children) only if its name fits; otherwise it is a plain field.
 fn titled(name: &str, r: Rect, header: f32) -> bool {
     // shortcut: estimated width of the 11.5pt bold title font; measure with egui if titles get cut.
     let w: f32 = name.chars().map(|c| if c.is_ascii() { 6.6 } else { 12.0 }).sum();
@@ -50,7 +48,6 @@ fn titled(name: &str, r: Rect, header: f32) -> bool {
 const DEFAULT_DEPTH: u16 = 2;
 
 /// `expanded`: dirs the user clicked open (only themselves: their subdirs stay closed).
-/// `pitch`: dot lattice pitch in points (see [`grid`]); every rect is snapped to it.
 /// `prev`: the previous layout, whose tones are kept where possible.
 pub fn build(tree: &Tree, root: u32, area: Rect, expanded: &HashSet<u32>, pitch: f32, prev: &[Tile], out: &mut Vec<Tile>) {
     {
@@ -61,8 +58,7 @@ pub fn build(tree: &Tree, root: u32, area: Rect, expanded: &HashSet<u32>, pitch:
     tones(out, snap(area, pitch), pitch, prev);
 }
 
-/// The rects of [`build`] without tones, down to dir `stop` (which is not opened; u32::MAX:
-/// none): where `stop` would be, for a zoom from or to it.
+/// The rects of [`build`] without tones, with dir `stop` left closed (u32::MAX: none).
 pub fn rects(tree: &Tree, root: u32, area: Rect, expanded: &HashSet<u32>, pitch: f32, stop: u32, out: &mut Vec<Tile>) {
     out.clear();
     if tree.dirs[root as usize].size > 0 {
@@ -73,11 +69,9 @@ pub fn rects(tree: &Tree, root: u32, area: Rect, expanded: &HashSet<u32>, pitch:
 /// Number of brightness tones (4 colours always suffice for a map of rectangles in practice).
 pub const TONES: u8 = 4;
 
-/// Map colouring of the visible tiles (everything not open) on a dot-lattice grid of tile indices.
-/// Big tiles go first; each takes the tone sharing the least edge length with same-toned coloured
-/// neighbours (ties: the one farthest from the other neighbours' tones). Tiles visible in `prev`
-/// keep their tone (see below), so expanding a folder doesn't recolour the blocks around it; a
-/// final pass recolours any other tile still clashing.
+/// Map colouring of the visible tiles: big ones first, each taking the tone that shares the least
+/// edge with same-toned neighbours. Tiles from `prev` keep theirs, so expanding never recolours far
+/// blocks; a final pass repairs any clash left.
 fn tones(out: &mut [Tile], area: Rect, pitch: f32, prev: &[Tile]) {
     const NEAR: [f32; TONES as usize] = [0.0, 0.3, 0.08, 0.0]; // secondary cost by tone distance
     let cols = (area.width() / pitch).round() as isize;
@@ -130,9 +124,7 @@ fn tones(out: &mut [Tile], area: Rect, pitch: f32, prev: &[Tile]) {
     // Same-tone edge first (any clash-free tone wins), then how close the other neighbours' tones are.
     let cost = |w: &[f32; TONES as usize], c: u8| (w[c as usize], (0..TONES).map(|n| w[n as usize] * NEAR[n.abs_diff(c) as usize]).sum::<f32>());
     let best = |w: &[f32; TONES as usize]| (0..TONES).min_by(|&a, &b| cost(w, a).partial_cmp(&cost(w, b)).unwrap()).unwrap();
-    // A tile that did not move keeps its tone whatever happens around it (so far-off blocks never
-    // change colour when a folder opens); one that moved keeps it if that clashes with nothing.
-    // (tone, rect) in `prev` per tile; the map is built from the smaller of the two layouts.
+    // A tile that did not move keeps its tone; one that moved keeps it if that clashes with nothing.
     let mut old: Vec<Option<(u8, Rect)>> = vec![None; out.len()];
     if prev.len() <= order.len() {
         let m: ItemMap<(u8, Rect)> = prev.iter().filter(|t| !t.open).map(|t| (t.item, (t.tone, t.rect))).collect();
@@ -167,9 +159,7 @@ fn tones(out: &mut [Tile], area: Rect, pitch: f32, prev: &[Tile]) {
             tone[i] = best(&near(i, &tone));
         }
     }
-    // Local repair: recolour wherever another tone clashes less, until nothing changes. A pass
-    // only revisits what a change in the one before can affect: the changed tiles and their
-    // neighbours (in `order`, as a full pass would).
+    // Local repair until nothing changes; each pass revisits only changed tiles and their neighbours.
     let mut rank = vec![0; out.len()];
     order.iter().enumerate().for_each(|(k, &i)| rank[i] = k);
     let mut work: Vec<usize> = order.iter().copied().filter(|&i| !still[i]).collect();
@@ -220,9 +210,8 @@ fn dir(tree: &Tree, d: u32, r: Rect, depth: u16, expanded: &HashSet<u32>, g: &Gr
         return;
     }
     out[idx].open = true;
-    // Children smaller than one dot are dropped (before sorting: a folder can hold a million files,
-    // a few thousand of which show); the rest are scaled up to fill the whole body, so no leftover
-    // patch of the folder's own field shows.
+    // Drop children under one dot before sorting (a folder may hold a million files), then scale the
+    // rest up to fill the body.
     let area = (inner.width() * inner.height()) as f64;
     let total = x.size as f64; // = its children's sizes
     let dot = (g.pitch * g.pitch) as f64;
@@ -238,19 +227,15 @@ fn dir(tree: &Tree, d: u32, r: Rect, depth: u16, expanded: &HashSet<u32>, g: &Gr
     for k in &mut kids {
         k.0 *= area / kept;
     }
-    // Tiles too small for a gutter (see shader.wgsl) can't be outlined one by one: from the first
-    // of them on (the smallest come last), they are gathered into one block that gets the gutter
-    // (top row and left column, the folder's dark body showing through) and fill it unoutlined.
-    // The block goes last, so it takes the bottom-right corner; whatever comes out too small
-    // beside it joins it too, until every tile outside it has room for its own gutter.
+    // Tiles too small for their own gutter are gathered into one block (last: bottom-right) that gets
+    // the gutter; whatever beside it comes out too small joins it too.
     let small = |r: Rect| {
         let r = snap(r, g.pitch);
         (r.width().min(r.height()) / g.pitch).round() < MIN_GUTTER
     };
     let mut placed = Vec::new();
     let mut k = kids.len();
-    // A block too small for its own gutter would leave its neighbours open: it is given more room
-    // than its files' share (up to MAX_REST of the body), the others shrinking to make way.
+    // A block too small for its own gutter gets more room (up to MAX_REST of the body).
     let mut boost = 1.0;
     loop {
         placed.clear();
@@ -268,8 +253,7 @@ fn dir(tree: &Tree, d: u32, r: Rect, depth: u16, expanded: &HashSet<u32>, g: &Gr
                 if top.last().is_some_and(|t| t.0 < area * MAX_REST) {
                     boost *= 1.5;
                 } else {
-                    // Still too small at that size: too small to show at all, like the sub-dot
-                    // tiles above; the rest grow to fill the body.
+                    // Still too small: dropped like the sub-dot tiles; the rest fill the body.
                     kids.truncate(k);
                     boost = 1.0;
                 }
@@ -467,8 +451,7 @@ mod tests {
         assert!((covered - inner.area()).abs() < 1e-2, "{covered} vs {}", inner.area());
     }
 
-    /// A remainder too small to outline as a block is given room for its gutter: it stays visible
-    /// (in its own outlined block), and the big file keeps its own outline instead of being merged.
+    /// A remainder too small for a block gets room for its gutter; the big file keeps its own outline.
     #[test]
     fn a_tiny_remainder_still_gets_an_outlined_block() {
         let mut t = Tree::new("R");
@@ -484,8 +467,7 @@ mod tests {
         assert!((gap - p).abs() < 0.01, "gap {gap}");
     }
 
-    /// Files too small for their own gutter sit together in one block, and that block has a whole
-    /// top row and left column of gutter (nothing covers it: the folder's dark body shows).
+    /// Files too small for their own gutter share one block with a whole gutter row and column.
     #[test]
     fn small_files_share_one_outlined_block() {
         let mut t = Tree::new("R");

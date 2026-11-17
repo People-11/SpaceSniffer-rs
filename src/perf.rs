@@ -1,6 +1,5 @@
-//! Frame timing printed to the console, only in `--features perf` builds (no-ops otherwise).
-//! Every second: frames and avg / max per section; any frame whose work takes longer than
-//! SLOW_MS: its own breakdown.
+//! Frame timing on the console, `--features perf` builds only: per second avg / max per section,
+//! and a breakdown of any frame slower than SLOW_MS.
 
 #[cfg(feature = "perf")]
 mod imp {

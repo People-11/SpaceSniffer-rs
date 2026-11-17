@@ -18,8 +18,7 @@ pub fn below_normal() {
     unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
 }
 
-/// Map a file read-only for the rest of the process. Pages load on first touch and stay file-backed
-/// (shared, evictable), so a 20 MB font costs only the glyphs drawn, not 20 MB of private heap.
+/// Map a file read-only for good: pages load on touch and stay file-backed, so a 20 MB font costs only its drawn glyphs.
 pub fn map_file(path: &str) -> Option<&'static [u8]> {
     use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, GetFileSizeEx, OPEN_EXISTING};
@@ -63,8 +62,7 @@ pub fn recycle(p: &Path) -> bool {
     let mut op: SHFILEOPSTRUCTW = unsafe { std::mem::zeroed() };
     op.wFunc = FO_DELETE;
     op.pFrom = w.as_ptr();
-    // WANTNUKEWARNING: Windows still asks before deleting for good what the bin cannot take (too
-    // big, or a drive without one), which NOCONFIRMATION alone would do silently.
+    // WANTNUKEWARNING: still ask before deleting for good what the bin cannot take.
     op.fFlags = (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING) as u16;
     unsafe { SHFileOperationW(&mut op) == 0 && op.fAnyOperationsAborted == 0 }
 }
@@ -83,14 +81,9 @@ pub fn reveal(p: &Path) {
     let _ = std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", p.display())).spawn();
 }
 
-/// Window setup that needs the HWND (called once from `App::new`):
-/// - Icons from the exe's icon resource (build.rs embeds assets/icon.ico as id 1; Windows decodes its
-///   PNG entries itself), at the system's big/small sizes. eframe would otherwise decode a PNG through
-///   the `image` crate, which is stubbed out (see stub/image).
-/// - Pure moves don't repaint: dragging the title bar sends WM_WINDOWPOSCHANGED per mouse step,
-///   winit turns it into `Moved`, egui repaints, and each frame waits in present inside the
-///   modal move loop, so the window lags and judders. Nothing we draw depends on the window position.
-/// - A dark title bar, kept dark after the settings broadcasts that winit answers with the system theme.
+/// Window setup that needs the HWND (once, from `App::new`): icons from the exe resource (eframe would
+/// decode a PNG through the stubbed `image` crate); pure moves skip the repaint (each one waited in
+/// present inside the modal move loop, so dragging juddered); a dark title bar.
 pub fn setup_window(h: &impl raw_window_handle::HasWindowHandle) {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::Shell::SetWindowSubclass;
@@ -139,8 +132,7 @@ unsafe extern "system" fn filter(
             }
         }
         let r = DefSubclassProc(hwnd, msg, wp, lp);
-        // winit follows the system theme on every settings broadcast and switches a light system's
-        // title bar back to light (it turned white at random): set it dark again.
+        // winit resets the title bar to the system theme on every settings broadcast: dark again.
         if msg == WM_SETTINGCHANGE {
             dark_title(hwnd);
         }

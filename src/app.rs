@@ -9,23 +9,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-// The pieces of the window: transitions (camera + waves), the layer stack drawn as one pixel field,
-// the drive chooser, and the treemap's own input and layout.
 mod anim;
 mod chooser;
+mod particles;
 mod scene;
 mod treemap;
 use anim::*;
 use chooser::*;
+use particles::*;
 use scene::*;
 use treemap::*;
 
 const BG: Color32 = Color32::from_rgb(11, 12, 15);
 const CARD: Color32 = Color32::from_rgb(21, 22, 26);
 const TEXT_DIM: Color32 = Color32::from_rgb(140, 144, 152);
-const MAX_PARTICLES: usize = 30000;
 
-/// Every folder shares one color (a warm copper); files are colored by type.
+/// All folders share one colour (a warm copper); files are coloured by type.
 const FOLDER_RGB: [u8; 3] = [184, 116, 66];
 
 fn c32(c: u8) -> Color32 {
@@ -42,18 +41,6 @@ pub fn fmt_size(b: u64) -> String {
         i += 1;
     }
     if i == 0 { format!("{b} B") } else { format!("{v:.1} {}", U[i]) }
-}
-
-/// One dot of a deleted tile, drifting up on the lattice and dimming level by level.
-struct Particle {
-    pos: Pos2,
-    vel: Vec2,
-    life: f32,
-    max: f32,
-    delay: f32,
-    col: [u8; 3],
-    /// Level it starts at (of the pixel field's 5).
-    level: f32,
 }
 
 pub struct App {
@@ -83,22 +70,19 @@ pub struct App {
     gpu_info: String,
     hover: Option<Item>,
     menu_item: Option<Item>,
-    /// Last press on the treemap: (time, pos, folder it hit); a second press there soon after
-    /// zooms into that folder.
+    /// Last press on the treemap (time, pos, folder): a second one there soon after zooms in.
     last_press: Option<(f64, Pos2, u32)>,
     /// Dot lattice pitch and folder title height (points) for the current DPI.
     pitch: f32,
     header: f32,
     /// Hover light of the current layout.
     lit: Lit,
-    /// Folders whose whole block is lit (hovered title): lift 0..1. Kept per folder, not per tile,
-    /// so lighting 10k blocks costs nothing; `lit.groups` is its per-frame form.
+    /// Folders lit as a whole (hovered title), 0..1, kept per folder, not per tile; `lit.groups` per frame.
     group_fx: Vec<(Item, f32)>,
     /// Camera of the target layout last frame (layout rect -> screen rect), for hit-testing mid-zoom.
     cam: Map,
     confirm: Option<Item>,
-    particles: Vec<Particle>,
-    rng: u64,
+    particles: Particles,
     t0: Instant,
     path_input: String,
     drives: Vec<Drive>,
@@ -149,8 +133,7 @@ impl App {
             group_fx: vec![],
             cam: (Rect::from_min_size(Pos2::ZERO, Vec2::splat(1.0)), Rect::from_min_size(Pos2::ZERO, Vec2::splat(1.0))),
             confirm: None,
-            particles: vec![],
-            rng: 0x2545f4914f6cdd1d,
+            particles: Particles::default(),
             t0: now,
             path_input: String::new(),
             drives: vec![],
@@ -168,13 +151,6 @@ impl App {
             app.start(&p);
         }
         app
-    }
-
-    fn rand(&mut self) -> f32 {
-        self.rng ^= self.rng << 13;
-        self.rng ^= self.rng >> 7;
-        self.rng ^= self.rng << 17;
-        (self.rng >> 40) as f32 / (1u64 << 24) as f32
     }
 
     fn now(&self) -> f32 {
@@ -221,8 +197,7 @@ impl App {
         self.anim = None;
     }
 
-    /// Forget everything that names a dir or file by index (back / forward, the hovered item, an
-    /// open context menu or delete dialog): after a rescan or delete it may be gone or reused.
+    /// Forget all that names a dir or file by index (history, hover, menu, delete dialog): it may be gone.
     fn drop_history(&mut self) {
         self.back.clear();
         self.fwd.clear();
@@ -303,7 +278,7 @@ impl App {
         self.drop_layout();
         self.drop_history();
         if let Some(r) = self.tiles.iter().find(|x| x.item == item).map(|x| x.rect) {
-            self.burst(r, col);
+            self.particles.burst(r, col, self.pitch);
         }
         // Files of that dir changed index (swap_remove): never hit-test those stale tiles.
         if let Item::File(d, _) = item {
@@ -311,63 +286,6 @@ impl App {
         }
         self.status = format!("Moved to Recycle Bin: {} ({})", path.display(), fmt_size(freed));
     }
-
-    /// Dissolve a rect into its dots, rising and dimming, right edge first.
-    fn burst(&mut self, r: Rect, col: [u8; 3]) {
-        // Whole dots of the lattice, thinned out on big tiles to stay within MAX_PARTICLES.
-        let p = self.pitch;
-        let step = ((r.area() / (p * p) / 12000.0).sqrt().ceil().max(1.0)) * p;
-        let mut y = r.min.y;
-        while y < r.max.y {
-            let mut x = r.min.x;
-            while x < r.max.x {
-                if self.rand() < 0.7 && self.particles.len() < MAX_PARTICLES {
-                    let (a, b, c, d) = (self.rand(), self.rand(), self.rand(), self.rand());
-                    self.particles.push(Particle {
-                        pos: pos2(x, y),
-                        vel: vec2((a - 0.5) * 50.0, -20.0 - b * 90.0),
-                        life: 0.6 + c * 1.2,
-                        max: 0.6 + c * 1.2,
-                        delay: (r.max.x - x) / r.width().max(1.0) * 0.5,
-                        col,
-                        level: if d < 0.5 { 4.0 } else { 3.0 },
-                    });
-                }
-                x += step;
-            }
-            y += step;
-        }
-    }
-
-    fn step_particles(&mut self, dt: f32) -> Vec<Inst> {
-        let mut out = Vec::with_capacity(self.particles.len());
-        self.particles.retain_mut(|p| {
-            if p.delay > 0.0 {
-                p.delay -= dt;
-                return true;
-            }
-            p.life -= dt;
-            p.vel.y -= 60.0 * dt;
-            p.vel.x *= 1.0 - dt;
-            p.pos += p.vel * dt;
-            p.life > 0.0
-        });
-        let pitch = self.pitch;
-        for p in self.particles.iter().filter(|p| p.delay <= 0.0) {
-            // The dot cell it is over, at a level stepping down as it dies.
-            let level = (p.level * (p.life / p.max).clamp(0.0, 1.0)).ceil();
-            let c = (p.pos.to_vec2() / pitch).floor() * pitch;
-            out.push(Inst {
-                rect: [c.x, c.y, c.x + pitch, c.y + pitch],
-                color: gfx::rgba(p.col, level / 4.0),
-                p: [gfx::PARTICLE, gfx::NO_LABEL, 0, 0],
-                q: [0; 4],
-            });
-        }
-        out
-    }
-
-    // ---------------------------------------------------------------- UI pieces
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let has_tree = self.tree.is_some() && !self.leaving;
@@ -407,8 +325,7 @@ impl App {
             }
             if let Some(t) = &self.tree {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Breadcrumb, right aligned: the current folder (rightmost) first, then up as far as
-                    // there is room ("…" for the rest); the current one itself is cut short if need be.
+                    // Breadcrumb, right aligned: the current folder, then up as far as there is room ("…" for the rest).
                     let font = egui::TextStyle::Button.resolve(ui.style());
                     let mut d = self.view;
                     loop {
@@ -498,9 +415,8 @@ fn setup_style(ctx: &egui::Context) {
         // Text is display only (text fields still select).
         s.interaction.selectable_labels = false;
     });
-    // No bundled fonts (keeps the exe small): Segoe UI for Latin, Microsoft YaHei for CJK file
-    // names, Segoe UI Symbol for menu symbols; toolbar icons from Segoe Fluent Icons (Windows 11)
-    // or Segoe MDL2 Assets (Windows 10), which share code points.
+    // No bundled fonts (exe size): Segoe UI, Microsoft YaHei for CJK names, Segoe UI Symbol; icons from
+    // Segoe Fluent Icons (Windows 11) or Segoe MDL2 Assets (Windows 10), which share code points.
     let mut fonts = egui::FontDefinitions::empty();
     let mut list = vec![];
     for file in ["segoeui.ttf", "msyh.ttc", "seguisym.ttf"] {
@@ -521,8 +437,7 @@ fn setup_style(ctx: &egui::Context) {
 }
 
 impl eframe::App for App {
-    /// The background is the clear colour, so the panels need no fill: under the treemap it was a
-    /// whole window of pixels drawn every frame only to be covered by the pixel field.
+    /// The clear colour is the background, so panels need no fill (a whole extra window of pixels).
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
         BG.to_normalized_gamma_f32()
     }
@@ -530,8 +445,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
-        // The whole previous frame on the CPU as eframe saw it (incl. tessellation and painting), less
-        // the waits for the swapchain: also the status bar's figure, as `ui` alone misses the upload.
+        // eframe's CPU time for the whole last frame, less swapchain waits (ui() alone misses the upload).
         let prev_cpu = frame.info().cpu_usage.unwrap_or(0.0) * 1e3;
         perf::add("prev-cpu", prev_cpu as f64);
         self.cpu_ms = self.cpu_ms * 0.9 + prev_cpu * 0.1;
@@ -596,7 +510,7 @@ impl eframe::App for App {
                 let _s = perf::span("treemap");
                 self.treemap(ui);
             }
-            let parts = self.step_particles(dt);
+            let parts = self.particles.step(dt, self.pitch);
             ui.painter().add(gfx::shape(ui.clip_rect(), 2, gfx::Field { insts: parts.into(), ..Default::default() }));
         });
 

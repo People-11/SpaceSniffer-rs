@@ -1,7 +1,4 @@
-//! Directory tree + incremental parallel scanner.
-//!
-//! Worker threads walk the disk and stream one `Batch` per directory to the UI thread,
-//! which merges it into the arena.
+//! Directory tree and parallel scanner: worker threads stream one `Batch` per dir to the UI thread.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -51,8 +48,7 @@ pub fn category(name: &str) -> u8 {
     }
 }
 
-/// 16 bytes; the name lives in the parent dir's `names` (one allocation per dir instead of one per
-/// file: about 30 bytes less per file, ~15 MB on half a million files).
+/// 16 bytes; the name lives in the dir's `names` (one allocation per dir: ~15 MB less on 500k files).
 pub struct File {
     pub size: u64,
     name_at: u32,
@@ -85,8 +81,7 @@ pub enum Item {
     File(u32, u32),
 }
 
-/// Map keyed by item with FxHash instead of std's SipHash: layouts hash tens of thousands of
-/// items (some per frame), and the keys are our own indices, so there is nothing to guard against.
+/// Item-keyed map with FxHash: layouts hash tens of thousands of our own indices, no DoS concern.
 pub type ItemMap<V> = std::collections::HashMap<Item, V, std::hash::BuildHasherDefault<Fx>>;
 
 #[derive(Default)]
@@ -333,10 +328,8 @@ fn list(path: PathBuf, id: u32, tx: &Sender<Batch>, next: &AtomicU32, cancel: &A
             if ft.is_symlink() {
                 continue; // symlinks + junctions: avoid double counting and cycles
             }
-            // Cloud storage (OneDrive Files On Demand): count what is on this disk. An online-only file
-            // takes none of it, and a cloud folder is fetched just by listing it. Downloaded files
-            // count as usual. The recall bits show even though Windows disguises placeholders from
-            // apps like this one; exposing them instead makes std open each one for its metadata.
+            // Cloud files (OneDrive Files On Demand) count only what is on this disk, and listing an online
+            // folder would fetch it. The recall bits show even though Windows disguises placeholders from us.
             let Ok(m) = e.metadata() else { continue };
             if std::os::windows::fs::MetadataExt::file_attributes(&m) & (RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS | OFFLINE) != 0 {
                 continue;
