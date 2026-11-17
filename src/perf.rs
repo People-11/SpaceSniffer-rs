@@ -66,26 +66,20 @@ mod imp {
             }
             if now.duration_since(since).as_secs_f64() >= 1.0 {
                 let acc = std::mem::take(&mut s.acc);
-                eprintln!(
-                    "{:3} fps  {}",
-                    s.frames,
-                    line(acc.iter().map(|(n, sum, max, k)| {
-                        if is_count(n) { format!("{n} {:.0}/{max:.0}", sum / *k as f64) } else { format!("{n} {:.2}/{max:.2}", sum / *k as f64) }
-                    }))
-                );
+                eprintln!("{:3} fps  {}", s.frames, line(acc.iter().map(|(n, sum, max, k)| format!("{}/{}", fmt(n, sum / *k as f64), num(n, *max)))));
                 s.frames = 0;
                 s.since = Some(now);
             }
         });
     }
 
-    /// Sections named `#…` are counts, not times.
-    fn is_count(n: &str) -> bool {
-        n.starts_with('#')
+    fn fmt(n: &str, v: f64) -> String {
+        format!("{n} {}", num(n, v))
     }
 
-    fn fmt(n: &str, v: f64) -> String {
-        if is_count(n) { format!("{n} {v:.0}") } else { format!("{n} {v:.2}") }
+    /// Sections named `#…` are counts, not times.
+    fn num(n: &str, v: f64) -> String {
+        format!("{v:.*}", if n.starts_with('#') { 0 } else { 2 })
     }
 }
 

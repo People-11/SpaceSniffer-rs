@@ -8,8 +8,9 @@ use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority,
 use windows_sys::Win32::UI::Shell::{FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_WANTNUKEWARNING, SHFILEOPSTRUCTW, SHFileOperationW, ShellExecuteW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MessageBoxW, SW_SHOWNORMAL};
 
-fn wide(s: &Path) -> Vec<u16> {
-    s.as_os_str().encode_wide().chain([0, 0]).collect() // double NUL: SHFileOperation list format
+/// NUL-terminated UTF-16, twice: a path list for SHFileOperation, a plain string everywhere else.
+fn wide(s: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
+    s.as_ref().encode_wide().chain([0, 0]).collect()
 }
 
 /// Run the calling thread below normal priority: a scan's burst yields to the UI and other apps.
@@ -23,9 +24,8 @@ pub fn map_file(path: &str) -> Option<&'static [u8]> {
     use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, GetFileSizeEx, OPEN_EXISTING};
     use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_READ, MapViewOfFile, PAGE_READONLY};
-    let w: Vec<u16> = path.encode_utf16().chain([0]).collect();
     unsafe {
-        let f = CreateFileW(w.as_ptr(), GENERIC_READ, FILE_SHARE_READ, std::ptr::null(), OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, std::ptr::null_mut());
+        let f = CreateFileW(wide(path).as_ptr(), GENERIC_READ, FILE_SHARE_READ, std::ptr::null(), OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, std::ptr::null_mut());
         if f == INVALID_HANDLE_VALUE {
             return None;
         }
@@ -70,15 +70,12 @@ pub fn recycle(p: &Path) -> bool {
 }
 
 pub fn open(p: &Path) {
-    let w = wide(p);
-    let verb: Vec<u16> = "open\0".encode_utf16().collect();
-    unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), w.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) };
+    unsafe { ShellExecuteW(std::ptr::null_mut(), wide("open").as_ptr(), wide(p).as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) };
 }
 
 /// The app has no console: tell the user why it could not start.
 pub fn error_box(msg: &str) {
-    let z = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
-    unsafe { MessageBoxW(std::ptr::null_mut(), z(msg).as_ptr(), z("SpaceSniffer-rs").as_ptr(), MB_ICONERROR) };
+    unsafe { MessageBoxW(std::ptr::null_mut(), wide(msg).as_ptr(), wide("SpaceSniffer-rs").as_ptr(), MB_ICONERROR) };
 }
 
 pub fn reveal(p: &Path) {

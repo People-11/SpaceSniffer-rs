@@ -1,15 +1,16 @@
-//! eframe（原生端）用到的 `image` API 的最小存根。
+//! Minimal stub of the `image` API that eframe (native) and arboard use, so the real crate and its
+//! codecs stay out of the exe.
 //!
-//! eframe 只在两处用 `image`：
-//! 1. 没设置窗口图标时解码内置的 egui PNG 图标 —— SRename-rs 总是自己设置图标，走不到；
-//! 2. Windows 上把图标缩放并重新编码成 PNG 来设任务栏大图标 —— 这里 `from_raw` 返回 None，
-//!    eframe 记一条日志后放弃，大小图标改由 `shell::set_window_icons` 直接用 DIB 创建。
+//! eframe uses `image` in two places:
+//! 1. Decoding egui's built-in PNG icon when the window has none: never reached, main.rs always
+//!    sets a placeholder icon.
+//! 2. On Windows, rescaling and re-encoding the icon as PNG for the taskbar: `from_raw` returns None
+//!    here, eframe logs it and gives up; `win::setup_window` sets the icons from the exe resource.
 //!
+//! arboard (eframe's `clipboard` feature) needs it only for image clipboard data (PNG/BMP): every
+//! codec here fails, so copying images fails; text is unaffected.
 //!
-//! 若开了 eframe 的 `clipboard` 功能，arboard 也会依赖 `image`，但只用于**图片**剪贴板
-//! （PNG/BMP 编解码）；这里的编解码器全部返回错误，图片复制粘贴会失败，文本剪贴板不受影响。
-//!
-//! 升级 eframe/arboard 时若编译失败，按报错补齐签名即可。
+//! If an eframe/arboard upgrade fails to build, add the signatures the errors ask for.
 
 use std::fmt;
 
@@ -49,7 +50,7 @@ pub trait ImageEncoder {
     fn write_image(self, buf: &[u8], width: u32, height: u32, color: ExtendedColorType) -> ImageResult<()>;
 }
 
-/// 所有解码器都构造失败，所以不会真的产生实例。
+/// Every decoder fails to construct, so there is never an instance.
 pub struct NoDecoder;
 
 impl ImageDecoder for NoDecoder {

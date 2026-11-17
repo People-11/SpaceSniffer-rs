@@ -49,7 +49,7 @@ fn titled(name: &str, r: Rect, header: f32) -> bool {
 /// Levels below the view root that are open by default; deeper dirs open only when expanded.
 const DEFAULT_DEPTH: u16 = 2;
 
-/// `expanded`: dirs the user clicked open; each opens itself and its direct subdirs.
+/// `expanded`: dirs the user clicked open (only themselves: their subdirs stay closed).
 /// `pitch`: dot lattice pitch in points (see [`grid`]); every rect is snapped to it.
 /// `prev`: the previous layout, whose tones are kept where possible.
 pub fn build(tree: &Tree, root: u32, area: Rect, expanded: &HashSet<u32>, pitch: f32, prev: &[Tile], out: &mut Vec<Tile>) {
@@ -215,7 +215,7 @@ fn dir(tree: &Tree, d: u32, r: Rect, depth: u16, expanded: &HashSet<u32>, g: &Gr
     // Children fill everything below the title strip: no padding gutters.
     let inner = Rect::from_min_max(pos2(r.min.x, r.min.y + g.header), r.max);
     // Opens by default only if its name fits; a folder the user clicked opens regardless.
-    let wanted = has_title && (depth <= DEFAULT_DEPTH || expanded.contains(&x.parent)) || expanded.contains(&d);
+    let wanted = has_title && depth <= DEFAULT_DEPTH || expanded.contains(&d);
     if !wanted || d == g.stop || inner.width() < 12.0 || inner.height() < g.pitch {
         return;
     }

@@ -170,21 +170,17 @@ impl Tree {
         d.files = b.files;
         d.names = b.names;
         d.dirs = ids;
-        self.add_up(b.id, sz, n, true);
+        self.add_up(b.id, sz, n);
         self.version += 1;
     }
 
-    /// Add (or subtract) `sz` bytes and `nfiles` files on `d` and all its ancestors.
-    fn add_up(&mut self, mut d: u32, sz: u64, nfiles: u64, add: bool) {
+    /// Add `sz` bytes and `nfiles` files on `d` and all its ancestors (wrapping: pass `0 - n` to
+    /// take `n` away).
+    fn add_up(&mut self, mut d: u32, sz: u64, nfiles: u64) {
         loop {
             let x = &mut self.dirs[d as usize];
-            if add {
-                x.size += sz;
-                x.nfiles += nfiles;
-            } else {
-                x.size -= sz;
-                x.nfiles -= nfiles;
-            }
+            x.size = x.size.wrapping_add(sz);
+            x.nfiles = x.nfiles.wrapping_add(nfiles);
             if d == 0 {
                 break;
             }
@@ -197,7 +193,7 @@ impl Tree {
     // refreshes of huge trees make memory grow.
     pub fn clear_dir(&mut self, d: u32) {
         let x = &self.dirs[d as usize];
-        self.add_up(d, x.size, x.nfiles, false);
+        self.add_up(d, x.size.wrapping_neg(), x.nfiles.wrapping_neg());
         let x = &mut self.dirs[d as usize];
         x.dirs.clear();
         x.files.clear();
@@ -213,12 +209,12 @@ impl Tree {
                 }
                 let x = &self.dirs[d as usize];
                 let (sz, n, p) = (x.size, x.nfiles, x.parent);
-                self.add_up(p, sz, n, false);
+                self.add_up(p, sz.wrapping_neg(), n.wrapping_neg());
                 self.dirs[p as usize].dirs.retain(|&c| c != d);
             }
             Item::File(d, f) => {
                 let file = self.dirs[d as usize].files.swap_remove(f as usize);
-                self.add_up(d, file.size, 1, false);
+                self.add_up(d, file.size.wrapping_neg(), u64::MAX);
             }
         }
         self.version += 1;
@@ -251,13 +247,9 @@ impl Batch {
     }
 }
 
-pub enum Msg {
-    Batch(Batch),
-    Done,
-}
-
+/// A running scan: one batch per listed dir, then the channel closes (every worker is done).
 pub struct Scan {
-    pub rx: Receiver<Msg>,
+    pub rx: Receiver<Batch>,
     pub cancel: Arc<AtomicBool>,
 }
 
@@ -288,14 +280,13 @@ pub fn start(root: PathBuf, id: u32, next: u32) -> Scan {
                 });
             }
         });
-        let _ = tx.send(Msg::Done);
     });
     Scan { rx, cancel }
 }
 
 type Work = Mutex<(Vec<(u32, PathBuf)>, usize)>;
 
-fn worker(work: &Work, cv: &Condvar, tx: &Sender<Msg>, next: &AtomicU32, cancel: &AtomicBool) {
+fn worker(work: &Work, cv: &Condvar, tx: &Sender<Batch>, next: &AtomicU32, cancel: &AtomicBool) {
     loop {
         let mut w = work.lock().unwrap();
         let (id, path) = loop {
@@ -323,13 +314,13 @@ fn worker(work: &Work, cv: &Condvar, tx: &Sender<Msg>, next: &AtomicU32, cancel:
     }
 }
 
-/// List one directory, send its batch and return its subdirectories (empty once cancelled).
 // FILE_ATTRIBUTE_*: not stored on this disk.
 const OFFLINE: u32 = 0x1000;
 const RECALL_ON_OPEN: u32 = 0x4_0000;
 const RECALL_ON_DATA_ACCESS: u32 = 0x40_0000;
 
-fn list(path: PathBuf, id: u32, tx: &Sender<Msg>, next: &AtomicU32, cancel: &AtomicBool) -> Vec<(u32, PathBuf)> {
+/// List one directory, send its batch and return its subdirectories (empty once cancelled).
+fn list(path: PathBuf, id: u32, tx: &Sender<Batch>, next: &AtomicU32, cancel: &AtomicBool) -> Vec<(u32, PathBuf)> {
     if cancel.load(Ordering::Relaxed) {
         return vec![];
     }
@@ -365,7 +356,7 @@ fn list(path: PathBuf, id: u32, tx: &Sender<Msg>, next: &AtomicU32, cancel: &Ato
     b.files.shrink_to_fit();
     b.names.shrink_to_fit();
     // Parent batch must be sent before any child batch (children reference the parent's slots).
-    if tx.send(Msg::Batch(b)).is_err() {
+    if tx.send(b).is_err() {
         return vec![];
     }
     sub
@@ -393,7 +384,7 @@ mod tests {
         }
         let scan = start(root.clone(), 0, 1);
         let mut t = Tree::new(root.to_str().unwrap());
-        while let Ok(Msg::Batch(b)) = scan.rx.recv() {
+        while let Ok(b) = scan.rx.recv() {
             t.apply(b);
         }
         std::fs::remove_dir_all(&root).unwrap();
@@ -438,7 +429,7 @@ mod tests {
             let t0 = std::time::Instant::now();
             let scan = start(PathBuf::from("C:\\"), 0, 1);
             let mut n = 0;
-            while let Ok(Msg::Batch(_)) = scan.rx.recv() {
+            while scan.rx.recv().is_ok() {
                 n += 1;
             }
             eprintln!("{n} dirs in {:?}", t0.elapsed());

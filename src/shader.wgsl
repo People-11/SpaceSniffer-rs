@@ -14,19 +14,25 @@ struct U {
     nw: f32,      // number of waves (0: no transition)
     cell0: vec2f, // first dot cell of the draw's texture (origin/size above cover its cells)
     header: f32,  // title strip height (pt) of open folders
+    ngroups: f32,
     // Per wave, 3 vec4s: origin.xy, max distance, progress K (0..1); region it acts on (min.xy,
     // max.xy); x = 1 if outside that region is new already (zoom out: the ring closes in).
     w: array<vec4f, 12>,
-    boxes: array<vec4f, 255>, // label boxes (min.xy, max.xy), indexed by an instance's p.y
+    // Per layer, its camera: layout rect, where that is on screen (min.xy, max.xy each).
+    cams: array<vec4f, 10>,
+    // Folders lit as a whole: rect (layout coords), then (lift, layer whose light it is, -, -).
+    groups: array<vec4f, 32>,
+    boxes: array<vec4f, 255>, // label boxes (min.xy, max.xy), indexed by an instance's d.y
 };
 @group(0) @binding(0) var<uniform> u: U;
 
-// Packed (see gfx::Inst); the vertex shader unpacks it into V.
+// Packed (see gfx::Inst, gfx::Dyn); the vertex shader unpacks it into V.
 struct Inst {
-    @location(0) rect: vec4f,  // min.xy, max.xy (points, screen space)
+    @location(0) rect: vec4f,  // min.xy, max.xy (points, in its first layer's layout)
     @location(1) color: vec4f, // rgb, intensity (particles: level / 4)
-    @location(2) p: vec4u,     // kind | 4 no gutter | 8 open; label box (255: none); first and last transition layer
-    @location(3) q: vec4f,     // hover, tone (0..1), label visibility (0..1), unused
+    @location(2) p: vec4u,     // kind | 4 no gutter | 8 open; unused; first and last transition layer
+    @location(3) q: vec4f,     // hover, tone (0..1), unused, unused
+    @location(4) d: vec4u,     // this frame: hover, label box (255: none), label visibility (0..255), unused
 };
 
 struct V {
@@ -47,17 +53,32 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> V {
         vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(0.0, 1.0),
         vec2f(0.0, 1.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0),
     );
-    let pt = mix(i.rect.xy, i.rect.zw, corners[vi]);
+    // Its first layer's camera (as app.rs `apply`, in the same order, so tiles land on the same cells).
+    let src = u.cams[i.p.z * 2u];
+    let dst = u.cams[i.p.z * 2u + 1u];
+    let k = (dst.zw - dst.xy) / (src.zw - src.xy);
+    let rect = vec4f(dst.xy + (i.rect.xy - src.xy) * k, dst.xy + (i.rect.zw - src.xy) * k);
+    let pt = mix(rect.xy, rect.zw, corners[vi]);
     let ndc = (pt - u.origin) / u.size * 2.0 - 1.0;
     var o: V;
     o.pos = vec4f(ndc.x, -ndc.y, 0.0, 1.0);
     o.pt = pt;
-    o.rect = i.rect;
+    o.rect = rect;
     let kind = i.p.x & 3u;
     o.color = vec4f(i.color.rgb, i.color.a * select(1.0, 4.0, kind == 2u));
     o.p = vec4f(f32(kind), f32((i.p.x >> 2u) & 1u), f32(i.p.z), f32(i.p.w));
-    o.q = vec4f(select(0.0, u.header, (i.p.x & 8u) != 0u), i.q.x, i.q.y, i.q.z);
-    o.t = select(vec4f(0.0, 0.0, -1.0, -1.0), u.boxes[min(i.p.y, 254u)], i.p.y < 255u);
+    // Inside a folder lit as a whole by its last layer's light (its rect strictly contains ours):
+    // lit as much.
+    var hover = max(i.q.x, f32(i.d.x) / 255.0);
+    for (var g = 0u; g < u32(u.ngroups); g++) {
+        let gr = u.groups[g * 2u];
+        let gv = u.groups[g * 2u + 1u];
+        if (u32(gv.y) == i.p.w && any(gr != i.rect) && all(gr.xy <= i.rect.xy) && all(i.rect.zw <= gr.zw)) {
+            hover = max(hover, gv.x);
+        }
+    }
+    o.q = vec4f(select(0.0, u.header, (i.p.x & 8u) != 0u), hover, i.q.y, f32(i.d.z) / 255.0);
+    o.t = select(vec4f(0.0, 0.0, -1.0, -1.0), u.boxes[min(i.d.y, 254u)], i.d.y < 255u);
     return o;
 }
 

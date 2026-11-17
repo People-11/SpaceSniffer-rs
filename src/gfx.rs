@@ -4,23 +4,61 @@
 //! Every dot cell is one colour, so each draw is rendered at one texel per cell into its own
 //! texture first, then scaled up cell by cell onto the screen: at 4K the heavy shader runs on
 //! 1/9-1/16 of the pixels.
+//!
+//! The instances stay on the GPU between frames, in layout coordinates: each frame sends only each
+//! layer's camera, the folders lit as a whole, and per instance 4 bytes of hover and label state.
 
 use eframe::egui;
 use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, RenderState, ScreenDescriptor};
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-/// 28 bytes: a draw can hold ~100k of them, uploaded every frame of a transition.
+/// 28 bytes: a draw can hold ~100k of them, uploaded only when its `Field::ver` changes.
 pub struct Inst {
+    /// In the coordinates of its first layer, which that layer's camera maps onto the screen.
     pub rect: [f32; 4],
     /// rgb, intensity (particles: level / 4); 0..255 = 0..1.
     pub color: [u8; 4],
-    /// Kind (FIELD / PARTICLE) | SOLID | OPEN; label box (index into the draw's `boxes`, NO_LABEL:
-    /// none); first and last transition layer it belongs to.
+    /// Kind (FIELD / PARTICLE) | SOLID | OPEN; unused; first and last transition layer it belongs to.
     pub p: [u8; 4],
-    /// Hover, tone, label visibility (scales the label box's dimming), unused; 0..255 = 0..1.
+    /// Hover (see also `Dyn`), tone, unused, unused; 0..255 = 0..1.
     pub q: [u8; 4],
+}
+
+/// An instance's state that changes from frame to frame: hover, label box (index into the draw's
+/// `boxes`, NO_LABEL: none), label visibility (scales the box's dimming), unused; 0..255 = 0..1.
+pub type Dyn = [u8; 4];
+pub const NO_DYN: Dyn = [0, NO_LABEL, 0, 0];
+
+/// A layer's camera: its layout rect and where that is on screen, as (min.xy, max.xy) each.
+pub type Cam = [[f32; 4]; 2];
+pub const IDENTITY: Cam = [[0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]];
+/// Layers a draw can show (one per wave, and the top one), each under its own camera.
+pub const LAYERS: usize = MAX_WAVES + 1;
+/// Folders lit as a whole (with every tile inside them) a draw can carry.
+pub const MAX_GROUPS: usize = 16;
+/// A folder lit as a whole: (rect in layout coords, lift 0..1, layer `hi` whose light it is). Every
+/// instance of that layer strictly inside the rect is lit as much.
+pub type Group = ([f32; 4], f32, u8);
+
+/// What one draw shows.
+#[derive(Default)]
+pub struct Field {
+    pub insts: Arc<[Inst]>,
+    /// Identifies `insts` (0: a one-off, uploaded every frame): the same as the slot's last draw
+    /// means they are on the GPU already.
+    pub ver: u64,
+    /// One per instance; empty: NO_DYN for all.
+    pub dyns: Vec<Dyn>,
+    /// Label boxes the dyns index (screen min.xy, max.xy), at most NO_LABEL.
+    pub boxes: Vec<[f32; 4]>,
+    /// At most MAX_WAVES, oldest first; layer j is shown where wave j-1 is the newest one passed.
+    pub waves: Vec<Wave>,
+    /// Per layer; missing ones: IDENTITY.
+    pub cams: Vec<Cam>,
+    pub groups: Vec<Group>,
 }
 
 /// In its folder's block of small tiles: no gutter of its own.
@@ -59,13 +97,17 @@ struct Uniform {
     cell0: [f32; 2],
     /// Title strip height (pt) of OPEN tiles.
     header: f32,
-    _pad: [f32; 3],
+    ngroups: f32,
+    _pad: [f32; 2],
     waves: [Wave; MAX_WAVES],
-    // Followed in the buffer by NO_LABEL label boxes (see `Draw::boxes`).
+    cams: [Cam; LAYERS],
+    /// Rect, then (lift, layer, -, -).
+    groups: [[[f32; 4]; 2]; MAX_GROUPS],
+    // Followed in the buffer by NO_LABEL label boxes (see `Field::boxes`).
 }
 
-// Layouts shader.wgsl relies on: the boxes start right after U's 15 vec4s.
-const _: () = assert!(size_of::<Inst>() == 28 && size_of::<Uniform>() == 15 * 16);
+// Layouts shader.wgsl relies on: the boxes start right after U's 3 + 12 + 10 + 32 vec4s.
+const _: () = assert!(size_of::<Inst>() == 28 && size_of::<Uniform>() == 57 * 16);
 
 /// Uniform buffer size: `Uniform`, then the label boxes.
 const UBUF: usize = size_of::<Uniform>() + NO_LABEL as usize * 16;
@@ -75,6 +117,9 @@ struct Slot {
     ubuf: wgpu::Buffer,
     bind: wgpu::BindGroup,
     ibuf: wgpu::Buffer,
+    /// The `Field::ver` of what `ibuf` holds.
+    ver: u64,
+    dbuf: wgpu::Buffer,
     cap: usize,
     count: u32,
     /// The draw at one texel per dot cell, its size in cells, and its bind group for the blit.
@@ -102,7 +147,7 @@ fn slot(dev: &wgpu::Device, bgl: &wgpu::BindGroupLayout) -> Slot {
         entries: &[wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() }],
     });
     let cap = 1024;
-    Slot { ubuf, bind, ibuf: inst_buf(dev, cap), cap, count: 0, tex: None }
+    Slot { ubuf, bind, ibuf: inst_buf(dev, cap, size_of::<Inst>()), ver: 0, dbuf: inst_buf(dev, cap, size_of::<Dyn>()), cap, count: 0, tex: None }
 }
 
 pub fn init(rs: &RenderState) {
@@ -164,11 +209,18 @@ pub fn init(rs: &RenderState) {
             module: &shader,
             entry_point: Some("vs"),
             compilation_options: Default::default(),
-            buffers: &[Some(wgpu::VertexBufferLayout {
-                array_stride: size_of::<Inst>() as u64,
-                step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Unorm8x4, 2 => Uint8x4, 3 => Unorm8x4],
-            })],
+            buffers: &[
+                Some(wgpu::VertexBufferLayout {
+                    array_stride: size_of::<Inst>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Unorm8x4, 2 => Uint8x4, 3 => Unorm8x4],
+                }),
+                Some(wgpu::VertexBufferLayout {
+                    array_stride: size_of::<Dyn>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![4 => Uint8x4],
+                }),
+            ],
         },
         fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), compilation_options: Default::default(), targets: &[target] }),
         primitive: Default::default(),
@@ -180,23 +232,19 @@ pub fn init(rs: &RenderState) {
     rs.renderer.write().callback_resources.insert(Res { pipeline, blit, bgl, tbgl, format: rs.target_format, slots: vec![] });
 }
 
-fn inst_buf(dev: &wgpu::Device, cap: usize) -> wgpu::Buffer {
+fn inst_buf(dev: &wgpu::Device, cap: usize, stride: usize) -> wgpu::Buffer {
     dev.create_buffer(&wgpu::BufferDescriptor {
         label: Some("inst"),
-        size: (cap * size_of::<Inst>()) as u64,
+        size: (cap * stride) as u64,
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     })
 }
 
 struct Draw {
-    insts: Vec<Inst>,
-    /// Label boxes (screen min.xy, max.xy), at most NO_LABEL: the dots under and around each stay dim.
-    boxes: Vec<[f32; 4]>,
+    f: Field,
     rect: egui::Rect,
     slot: usize,
-    waves: [Wave; MAX_WAVES],
-    nw: usize,
 }
 
 impl CallbackTrait for Draw {
@@ -209,40 +257,68 @@ impl CallbackTrait for Draw {
         res: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         let _s = crate::perf::span("prev-upload");
-        crate::perf::add("#prev-upload-kb", (self.insts.len() * size_of::<Inst>()) as f64 / 1024.0);
+        let f = &self.f;
         let res: &mut Res = res.get_mut().unwrap();
         while res.slots.len() <= self.slot {
             res.slots.push(slot(dev, &res.bgl));
         }
         let r = &mut res.slots[self.slot];
-        r.count = self.insts.len() as u32;
-        if r.count == 0 {
+        let count = f.insts.len();
+        r.count = count as u32;
+        if count == 0 {
             return vec![];
         }
-        if self.insts.len() > r.cap {
-            r.cap = self.insts.len().next_power_of_two();
-            r.ibuf = inst_buf(dev, r.cap);
+        if count > r.cap {
+            r.cap = count.next_power_of_two();
+            r.ibuf = inst_buf(dev, r.cap, size_of::<Inst>());
+            r.dbuf = inst_buf(dev, r.cap, size_of::<Dyn>());
+            r.ver = 0;
         }
-        queue.write_buffer(&r.ibuf, 0, bytemuck::cast_slice(&self.insts));
+        if f.ver == 0 || f.ver != r.ver {
+            crate::perf::add("#prev-upload-kb", (count * size_of::<Inst>()) as f64 / 1024.0);
+            queue.write_buffer(&r.ibuf, 0, bytemuck::cast_slice(&f.insts));
+            r.ver = f.ver;
+        }
+        let none;
+        let dyns = if f.dyns.len() == count {
+            &f.dyns[..]
+        } else {
+            none = vec![NO_DYN; count];
+            &none[..]
+        };
+        queue.write_buffer(&r.dbuf, 0, bytemuck::cast_slice(dyns));
         // The dot cells the rect touches (cell size as in shader.wgsl).
         let ppp = sd.pixels_per_point;
         let cs = (2.0 * ppp).floor().max(2.0);
         let c0 = (self.rect.min.to_vec2() * ppp / cs).floor();
         let c1 = (self.rect.max.to_vec2() * ppp / cs).ceil();
         let n = [(c1.x - c0.x).max(1.0) as u32, (c1.y - c0.y).max(1.0) as u32];
+        let (mut waves, mut cams, mut groups) = ([[[0.0; 4]; 3]; MAX_WAVES], [IDENTITY; LAYERS], [[[0.0; 4]; 2]; MAX_GROUPS]);
+        let nw = f.waves.len().min(MAX_WAVES);
+        waves[..nw].copy_from_slice(&f.waves[..nw]);
+        let nc = f.cams.len().min(LAYERS);
+        cams[..nc].copy_from_slice(&f.cams[..nc]);
+        // shortcut: past MAX_GROUPS the rest are not lit as a whole; only hovering across many
+        // titles during a transition gets near it.
+        for (g, &(rect, lift, hi)) in groups.iter_mut().zip(&f.groups) {
+            *g = [rect, [lift, hi as f32, 0.0, 0.0]];
+        }
         let u = Uniform {
             origin: (c0 * cs / ppp).into(),
             size: (egui::vec2(n[0] as f32, n[1] as f32) * cs / ppp).into(),
             ppp,
-            nw: self.nw as f32,
+            nw: nw as f32,
             cell0: c0.into(),
             header: crate::layout::header(crate::layout::grid(ppp)),
-            _pad: [0.0; 3],
-            waves: self.waves,
+            ngroups: f.groups.len().min(MAX_GROUPS) as f32,
+            _pad: [0.0; 2],
+            waves,
+            cams,
+            groups,
         };
         queue.write_buffer(&r.ubuf, 0, bytemuck::bytes_of(&u));
-        if !self.boxes.is_empty() {
-            queue.write_buffer(&r.ubuf, size_of::<Uniform>() as u64, bytemuck::cast_slice(&self.boxes[..self.boxes.len().min(NO_LABEL as usize)]));
+        if !f.boxes.is_empty() {
+            queue.write_buffer(&r.ubuf, size_of::<Uniform>() as u64, bytemuck::cast_slice(&f.boxes[..f.boxes.len().min(NO_LABEL as usize)]));
         }
         if r.tex.as_ref().is_none_or(|t| t.1 != n) {
             let tex = dev.create_texture(&wgpu::TextureDescriptor {
@@ -279,6 +355,7 @@ impl CallbackTrait for Draw {
         pass.set_pipeline(&res.pipeline);
         pass.set_bind_group(0, &r.bind, &[]);
         pass.set_vertex_buffer(0, r.ibuf.slice(..));
+        pass.set_vertex_buffer(1, r.dbuf.slice(..));
         pass.draw(0..6, 0..r.count);
         vec![]
     }
@@ -294,16 +371,8 @@ impl CallbackTrait for Draw {
     }
 }
 
-/// `slot` must be unique per callback within a frame. The painter's clip rect becomes the scissor.
-pub fn paint(painter: &egui::Painter, rect: egui::Rect, insts: Vec<Inst>, slot: usize, waves: &[Wave]) {
-    painter.add(shape(rect, insts, vec![], slot, waves));
-}
-
-/// The paint callback as a shape, for callers that reserve its place in the paint order first.
-/// `waves`: at most MAX_WAVES, oldest first; layer j is shown where wave j-1 is the newest one passed.
-/// `boxes`: label boxes the instances' `p[1]` index.
-pub fn shape(rect: egui::Rect, insts: Vec<Inst>, boxes: Vec<[f32; 4]>, slot: usize, waves: &[Wave]) -> egui::Shape {
-    let mut w = [[[0.0; 4]; 3]; MAX_WAVES];
-    w[..waves.len()].copy_from_slice(waves);
-    egui_wgpu::Callback::new_paint_callback(rect, Draw { insts, boxes, rect, slot, waves: w, nw: waves.len() }).into()
+/// The paint callback as a shape. `slot` must be unique per callback within a frame; the painter's
+/// clip rect becomes the scissor.
+pub fn shape(rect: egui::Rect, slot: usize, f: Field) -> egui::Shape {
+    egui_wgpu::Callback::new_paint_callback(rect, Draw { f, rect, slot }).into()
 }
