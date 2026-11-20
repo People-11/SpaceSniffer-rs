@@ -47,6 +47,12 @@ pub struct App {
     tree: Option<Tree>,
     scan: Option<tree::Scan>,
     scan_t0: Instant,
+    /// `scan` is only a refresh of what the watch saw change: quiet, and not in the way.
+    refreshing: bool,
+    /// Dirs a refresh relisted this frame: their files changed index (the tiles hit-tested are older).
+    stale: HashSet<u32>,
+    watch: Option<crate::watch::Watch>,
+    ctx: egui::Context,
     view: u32,
     back: Vec<u32>,
     fwd: Vec<u32>,
@@ -108,6 +114,10 @@ impl App {
             tree: None,
             scan: None,
             scan_t0: now,
+            refreshing: false,
+            stale: HashSet::new(),
+            watch: None,
+            ctx: cc.egui_ctx.clone(),
             view: 0,
             back: vec![],
             fwd: vec![],
@@ -171,11 +181,15 @@ impl App {
         let pb = std::path::absolute(&pb).unwrap_or(pb);
         self.tree = Some(Tree::new(&pb.to_string_lossy()));
         self.reset_nav();
+        // From the start: what changes during the scan is caught up on after it.
+        let ctx = self.ctx.clone();
+        self.watch = crate::watch::watch(&pb, move || ctx.request_repaint());
         self.begin_scan(pb, 0, 1);
     }
 
     fn begin_scan(&mut self, path: PathBuf, id: u32, next: u32) {
-        self.scan = Some(tree::start(path, id, next));
+        self.scan = Some(tree::start(vec![(id, path, vec![])], next));
+        self.refreshing = false;
         self.scan_t0 = Instant::now();
         self.status = "Scanning…".into();
     }
@@ -209,7 +223,15 @@ impl App {
     /// Rescan only the current view (SpaceSniffer "refresh").
     fn rescan(&mut self) {
         let Some(t) = self.tree.as_mut() else { return };
-        self.scan = None;
+        // A refresh is let finish (it is short): cut off, the new dirs it found would stay half listed.
+        if let Some(s) = self.scan.take().filter(|_| self.refreshing) {
+            while let Ok(b) = s.rx.recv() {
+                t.apply(b);
+            }
+            while t.dirs[self.view as usize].dead {
+                self.view = t.dirs[self.view as usize].parent;
+            }
+        }
         if self.view == 0 {
             let root = t.dirs[0].name.to_string();
             self.start(&root);
@@ -225,27 +247,80 @@ impl App {
         self.begin_scan(path, self.view, next);
     }
 
+    /// A scan, not a refresh.
+    fn scanning(&self) -> bool {
+        self.scan.is_some() && !self.refreshing
+    }
+
     fn pump(&mut self) {
-        let Some(scan) = &self.scan else { return };
+        self.stale.clear();
         let Some(t) = self.tree.as_mut() else { return };
-        let budget = Instant::now();
-        let mut done = false;
-        // Bounded so a burst of batches never stalls a frame.
-        while budget.elapsed().as_millis() < 8 {
-            match scan.rx.try_recv() {
-                Ok(b) => t.apply(b),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    done = true;
-                    break;
+        if let Some(scan) = &self.scan {
+            let budget = Instant::now();
+            let mut done = false;
+            // Bounded so a burst of batches never stalls a frame.
+            while budget.elapsed().as_millis() < 8 {
+                match scan.rx.try_recv() {
+                    Ok(b) => {
+                        let id = b.id;
+                        if t.apply(b) && self.refreshing {
+                            self.stale.insert(id);
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        done = true;
+                        break;
+                    }
+                    Err(_) => break,
                 }
-                Err(_) => break,
+            }
+            if done {
+                self.scan = None;
+                if !self.refreshing {
+                    let secs = self.scan_t0.elapsed().as_secs_f32();
+                    self.status = format!("Ready · scanned in {secs:.2}s");
+                }
             }
         }
-        if done {
-            self.scan = None;
-            let secs = self.scan_t0.elapsed().as_secs_f32();
-            self.status = format!("Ready · scanned in {secs:.2}s");
+        if self.refreshing && !self.stale.is_empty() {
+            // Whatever names a relisted dir's file or a dir now gone may mean something else: forget it.
+            let stale = |it: &Item| match *it {
+                Item::Dir(d) => t.dirs[d as usize].dead,
+                Item::File(d, _) => self.stale.contains(&d) || t.dirs[d as usize].dead,
+            };
+            self.menu_item = self.menu_item.filter(|x| !stale(x));
+            self.confirm = self.confirm.filter(|x| !stale(x));
+            self.back.retain(|&d| !t.dirs[d as usize].dead);
+            self.fwd.retain(|&d| !t.dirs[d as usize].dead);
+            while t.dirs[self.view as usize].dead {
+                self.view = t.dirs[self.view as usize].parent;
+            }
         }
+        if self.scan.is_none() {
+            self.refresh();
+        }
+    }
+
+    /// Relist the dirs the watch saw change (all of them if it lost count), keeping their subdirs.
+    fn refresh(&mut self) {
+        let (Some(w), Some(t)) = (&self.watch, &self.tree) else { return };
+        let mut dirs = HashSet::new();
+        let mut all = false;
+        while let Ok(c) = w.rx.try_recv() {
+            match c {
+                Some(paths) => dirs.extend(paths.iter().map(|p| t.find(p))),
+                None => all = true,
+            }
+        }
+        if all {
+            dirs = (0..t.dirs.len() as u32).filter(|&d| !t.dirs[d as usize].dead).collect();
+        }
+        if dirs.is_empty() {
+            return;
+        }
+        let jobs = dirs.into_iter().map(|d| (d, t.path(Item::Dir(d)), t.known(d))).collect();
+        self.scan = Some(tree::start(jobs, t.dirs.len() as u32));
+        self.refreshing = true;
     }
 
     fn navigate(&mut self, d: u32) {
@@ -316,10 +391,10 @@ impl App {
             }
             ui.separator();
             // Not while scanning: rescanning one folder cancels the scan of everything else.
-            if tool(ui, "\u{E72C}", "Rescan current view (F5)", has_tree && self.scan.is_none(), f5) {
+            if tool(ui, "\u{E72C}", "Rescan current view (F5)", has_tree && !self.scanning(), f5) {
                 self.rescan();
             }
-            if tool(ui, "\u{E71A}", "Stop scanning", self.scan.is_some(), false) {
+            if tool(ui, "\u{E71A}", "Stop scanning", self.scanning(), false) {
                 self.scan = None;
                 self.status = "Stopped".into();
             }
@@ -476,7 +551,7 @@ impl eframe::App for App {
 
         egui::Panel::bottom("status").frame(egui::Frame::NONE.inner_margin(Margin::symmetric(12, 4))).show(ui, |ui| {
             ui.horizontal(|ui| {
-                let dot = if self.scan.is_some() { c32(5) } else { c32(1) };
+                let dot = if self.scanning() { c32(5) } else { c32(1) };
                 ui.label(RichText::new("●").color(dot));
                 ui.label(RichText::new(&self.status).color(TEXT_DIM));
                 if let Some(t) = &self.tree {

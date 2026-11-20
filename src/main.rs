@@ -5,6 +5,7 @@ mod gfx;
 mod layout;
 mod perf;
 mod tree;
+mod watch;
 mod win;
 
 use eframe::egui_wgpu::{SurfaceConfig, WgpuSetup, WgpuSetupCreateNew};

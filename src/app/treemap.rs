@@ -99,6 +99,11 @@ impl App {
         let hit = resp.hover_pos().and_then(|p| {
             let p = apply(inverse(self.cam), p);
             let x = self.tiles.iter().rev().find(|x| x.rect.contains(p))?;
+            if let Item::File(d, _) = x.item
+                && self.stale.contains(&d)
+            {
+                return None; // relisted since these tiles were laid out
+            }
             Some(Hit { item: x.item, open: x.open, title: x.open && p.y < x.rect.min.y + self.header })
         });
         self.press(ui, &resp, hit);
@@ -284,7 +289,7 @@ impl App {
         }
         // Zoom and delete need `&mut self`, so they are applied after the menu; the rest act at once.
         let (mut zoom, mut delete) = (None, None);
-        let scanning = self.scan.is_some();
+        let scanning = self.scanning();
         resp.context_menu(|ui| {
             let (Some(item), Some(t)) = (self.menu_item, self.tree.as_ref()) else {
                 ui.close();

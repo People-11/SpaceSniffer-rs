@@ -154,6 +154,7 @@ impl App {
     /// Back to the chooser: zoom out to it, then drop the tree (see [`App::leave`]).
     pub fn leave_for_chooser(&mut self, ctx: &egui::Context) {
         self.scan = None;
+        self.watch = None;
         self.status = "Ready".into();
         self.refresh_drives(ctx);
         self.leaving = self.tree.is_some();

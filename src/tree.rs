@@ -1,6 +1,6 @@
 //! Directory tree and parallel scanner: worker threads stream one `Batch` per dir to the UI thread.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
@@ -66,6 +66,8 @@ pub struct Dir {
     pub files: Vec<File>,
     /// Names of `files`, back to back.
     names: String,
+    /// Gone from the tree (deleted, or a slot whose listing never came): its batches are dropped.
+    pub dead: bool,
 }
 
 impl Dir {
@@ -150,16 +152,37 @@ impl Tree {
         }
     }
 
-    pub fn apply(&mut self, b: Batch) {
-        let (sz, n) = (b.files.iter().map(|f| f.size).sum(), b.files.len() as u64);
+    /// Install a dir's listing over what it held. Subdirs already in the tree keep their contents;
+    /// those no longer listed go. False if the dir itself is gone.
+    pub fn apply(&mut self, b: Batch) -> bool {
+        if self.dirs.get(b.id as usize).is_none_or(|d| d.dead) {
+            return false;
+        }
         let max = b.dirs.iter().map(|d| d.0).max().unwrap_or(0) as usize;
         if max >= self.dirs.len() {
-            self.dirs.resize_with(max + 1, Dir::default);
+            self.dirs.resize_with(max + 1, || Dir { dead: true, ..Default::default() });
         }
+        let d = &self.dirs[b.id as usize];
+        let old: u64 = d.files.iter().map(|f| f.size).sum();
+        let mut sz = b.files.iter().map(|f| f.size).sum::<u64>().wrapping_sub(old);
+        let mut n = (b.files.len() as u64).wrapping_sub(d.files.len() as u64);
+        let before = std::mem::take(&mut self.dirs[b.id as usize].dirs);
         let mut ids = Vec::with_capacity(b.dirs.len());
         for (cid, name) in b.dirs {
-            self.dirs[cid as usize] = Dir { name, parent: b.id, ..Default::default() };
+            // New ids are fresh (dead) slots; a live one is a subdir it already had (see `known`).
+            if self.dirs[cid as usize].dead {
+                self.dirs[cid as usize] = Dir { name, parent: b.id, ..Default::default() };
+            }
             ids.push(cid);
+        }
+        if !before.is_empty() {
+            let mut kept = ids.clone();
+            kept.sort_unstable();
+            for c in before.into_iter().filter(|c| kept.binary_search(c).is_err()) {
+                let x = &self.dirs[c as usize];
+                (sz, n) = (sz.wrapping_sub(x.size), n.wrapping_sub(x.nfiles));
+                self.bury(c);
+            }
         }
         let d = &mut self.dirs[b.id as usize];
         d.files = b.files;
@@ -167,6 +190,39 @@ impl Tree {
         d.dirs = ids;
         self.add_up(b.id, sz, n);
         self.version += 1;
+        true
+    }
+
+    /// Its subdirs by name, sorted: what a relisting of `d` keeps (see [`Job`]).
+    pub fn known(&self, d: u32) -> Vec<(Box<str>, u32)> {
+        let mut k: Vec<_> = self.dirs[d as usize].dirs.iter().map(|&c| (self.dirs[c as usize].name.clone(), c)).collect();
+        k.sort_unstable();
+        k
+    }
+
+    /// The dir at `rel` (components below the root), or its deepest ancestor in the tree.
+    pub fn find(&self, rel: &Path) -> u32 {
+        let mut d = 0;
+        for c in rel.components() {
+            let Some(c) = c.as_os_str().to_str() else { break };
+            let kids = &self.dirs[d as usize].dirs;
+            let Some(&k) = kids.iter().find(|&&k| self.dirs[k as usize].name.eq_ignore_ascii_case(c)) else { break };
+            d = k;
+        }
+        d
+    }
+
+    /// Mark `d` and all below it dead and free their contents (their slots stay, empty).
+    fn bury(&mut self, d: u32) {
+        let mut stack = vec![d];
+        while let Some(d) = stack.pop() {
+            let x = &mut self.dirs[d as usize];
+            x.dead = true;
+            stack.append(&mut x.dirs);
+            x.dirs = vec![];
+            x.files = vec![];
+            x.names = String::new();
+        }
     }
 
     /// Add `sz` bytes and `nfiles` files on `d` and all its ancestors (wrapping: pass `0 - n` to
@@ -184,13 +240,13 @@ impl Tree {
     }
 
     /// Empty a directory before rescanning it.
-    // shortcut: old descendant slots are orphaned, never reused; compact after a scan if repeated
-    // refreshes of huge trees make memory grow.
+    // shortcut: dead slots are never reused (~120 bytes each, contents freed); compact if long
+    // sessions on churning trees make that add up.
     pub fn clear_dir(&mut self, d: u32) {
         let x = &self.dirs[d as usize];
         self.add_up(d, x.size.wrapping_neg(), x.nfiles.wrapping_neg());
+        std::mem::take(&mut self.dirs[d as usize].dirs).into_iter().for_each(|c| self.bury(c));
         let x = &mut self.dirs[d as usize];
-        x.dirs.clear();
         x.files.clear();
         x.names.clear();
         self.version += 1;
@@ -206,6 +262,7 @@ impl Tree {
                 let (sz, n, p) = (x.size, x.nfiles, x.parent);
                 self.add_up(p, sz.wrapping_neg(), n.wrapping_neg());
                 self.dirs[p as usize].dirs.retain(|&c| c != d);
+                self.bury(d);
             }
             Item::File(d, f) => {
                 let file = self.dirs[d as usize].files.swap_remove(f as usize);
@@ -254,15 +311,19 @@ impl Drop for Scan {
     }
 }
 
-/// Scan `root` into dir slot `id`; new dirs get ids from `next` upward.
-pub fn start(root: PathBuf, id: u32, next: u32) -> Scan {
+/// A dir to list: its slot, path, and the subdirs it already has (by name, sorted). Those keep their
+/// slot and are not listed again; any other subdir is new and scanned whole.
+pub type Job = (u32, PathBuf, Vec<(Box<str>, u32)>);
+
+/// List `jobs`; new dirs get ids from `next` upward.
+pub fn start(jobs: Vec<Job>, next: u32) -> Scan {
     let (tx, rx) = channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let c = cancel.clone();
     std::thread::spawn(move || {
         let next = AtomicU32::new(next);
         // Work stack of dirs still to list + count of dirs being listed right now.
-        let work = Mutex::new((vec![(id, root)], 0usize));
+        let work = Mutex::new((jobs, 0usize));
         let cv = Condvar::new();
         // Beyond about half the cores the threads only contend on file system locks: same speed
         // (warm cache, C:\ on 20 cores), several times the CPU.
@@ -279,12 +340,12 @@ pub fn start(root: PathBuf, id: u32, next: u32) -> Scan {
     Scan { rx, cancel }
 }
 
-type Work = Mutex<(Vec<(u32, PathBuf)>, usize)>;
+type Work = Mutex<(Vec<Job>, usize)>;
 
 fn worker(work: &Work, cv: &Condvar, tx: &Sender<Batch>, next: &AtomicU32, cancel: &AtomicBool) {
     loop {
         let mut w = work.lock().unwrap();
-        let (id, path) = loop {
+        let job = loop {
             if let Some(job) = w.0.pop() {
                 w.1 += 1;
                 break job;
@@ -295,7 +356,7 @@ fn worker(work: &Work, cv: &Condvar, tx: &Sender<Batch>, next: &AtomicU32, cance
             w = cv.wait(w).unwrap();
         };
         drop(w);
-        let sub = list(path, id, tx, next, cancel);
+        let sub = list(job, tx, next, cancel);
         let mut w = work.lock().unwrap();
         w.1 -= 1;
         let n = sub.len();
@@ -315,7 +376,7 @@ const RECALL_ON_OPEN: u32 = 0x4_0000;
 const RECALL_ON_DATA_ACCESS: u32 = 0x40_0000;
 
 /// List one directory, send its batch and return its subdirectories (empty once cancelled).
-fn list(path: PathBuf, id: u32, tx: &Sender<Batch>, next: &AtomicU32, cancel: &AtomicBool) -> Vec<(u32, PathBuf)> {
+fn list((id, path, known): Job, tx: &Sender<Batch>, next: &AtomicU32, cancel: &AtomicBool) -> Vec<Job> {
     if cancel.load(Ordering::Relaxed) {
         return vec![];
     }
@@ -337,8 +398,14 @@ fn list(path: PathBuf, id: u32, tx: &Sender<Batch>, next: &AtomicU32, cancel: &A
             let name = e.file_name();
             let name = name.to_string_lossy();
             if ft.is_dir() {
-                let cid = next.fetch_add(1, Ordering::Relaxed);
-                sub.push((cid, e.path()));
+                let cid = match known.binary_search_by(|k| (*k.0).cmp(&name)) {
+                    Ok(i) => known[i].1,
+                    Err(_) => {
+                        let cid = next.fetch_add(1, Ordering::Relaxed);
+                        sub.push((cid, e.path(), vec![]));
+                        cid
+                    }
+                };
                 b.dirs.push((cid, name.into()));
             } else {
                 b.push_file(&name, m.len());
@@ -375,7 +442,7 @@ mod tests {
                 std::fs::write(d.join(f), [0u8; 10]).unwrap();
             }
         }
-        let scan = start(root.clone(), 0, 1);
+        let scan = start(vec![(0, root.clone(), vec![])], 1);
         let mut t = Tree::new(root.to_str().unwrap());
         while let Ok(b) = scan.rx.recv() {
             t.apply(b);
@@ -414,13 +481,33 @@ mod tests {
         assert_eq!(root(&t), (35, 3));
     }
 
+    #[test]
+    fn relisting_keeps_known_dirs_and_drops_gone_ones() {
+        let mut t = Tree::new("R");
+        t.apply(Batch::of(0, [("a".into(), 10)], vec![(1, "s".into()), (2, "u".into())]));
+        t.apply(Batch::of(1, [("b".into(), 100)], vec![]));
+        t.apply(Batch::of(2, [("c".into(), 1000)], vec![(3, "deep".into())]));
+        t.apply(Batch::of(3, [("d".into(), 5)], vec![]));
+        assert_eq!((t.dirs[0].size, t.dirs[0].nfiles), (1115, 4));
+        assert_eq!(t.find(Path::new("U/deep")), 3);
+        assert_eq!(t.find(Path::new("u/nope/x")), 2);
+        assert_eq!(t.known(0), vec![("s".into(), 1), ("u".into(), 2)]);
+        // Relisted: a grew, z is new, s kept (not relisted), u gone, n new.
+        t.apply(Batch::of(0, [("a".into(), 12), ("z".into(), 1)], vec![(1, "s".into()), (4, "n".into())]));
+        assert_eq!((t.dirs[0].size, t.dirs[0].nfiles), (113, 3));
+        assert_eq!((t.dirs[1].size, t.dirs[2].dead, t.dirs[3].dead, t.dirs[3].files.len()), (100, true, true, 0));
+        assert!(t.apply(Batch::of(4, [("e".into(), 7)], vec![])));
+        assert!(!t.apply(Batch::of(3, [("late".into(), 9)], vec![]))); // its dir is gone
+        assert_eq!((t.dirs[0].size, t.dirs[0].nfiles, t.dirs[0].dirs.clone()), (120, 4, vec![1, 4]));
+    }
+
     /// `cargo test --release scan_bench -- --ignored --nocapture`: time a full scan of C:\.
     #[test]
     #[ignore]
     fn scan_bench() {
         for _ in 0..5 {
             let t0 = std::time::Instant::now();
-            let scan = start(PathBuf::from("C:\\"), 0, 1);
+            let scan = start(vec![(0, PathBuf::from("C:\\"), vec![])], 1);
             let mut n = 0;
             while scan.rx.recv().is_ok() {
                 n += 1;
